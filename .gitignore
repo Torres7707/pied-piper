@@ -1,0 +1,7 @@
+node_modules/
+dist/
+coverage/
+.piedpiper/events.jsonl
+.piedpiper/tmp/
+*.log
+.DS_Store
