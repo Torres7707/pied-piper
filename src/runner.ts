@@ -126,6 +126,7 @@ export async function runRole(input: RunRoleInput): Promise<RunRoleResult> {
     cwd,
     model: roleConfig.model,
     sessionId: input.sessionId,
+    access: roleConfig.access,
     timeoutMs,
   })
 

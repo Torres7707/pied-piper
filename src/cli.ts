@@ -3,7 +3,7 @@ import { realpathSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { parseArgs } from 'node:util'
-import { createAdapterResolver, type Adapter } from './adapters.js'
+import { createAdapterResolver, type Adapter, type AdapterResolverOptions } from './adapters.js'
 import { loadConfig } from './config.js'
 import { runRole } from './runner.js'
 
@@ -12,6 +12,7 @@ export interface CliDeps {
   stdout?: (text: string) => void
   stderr?: (text: string) => void
   adapterOverrides?: Partial<Record<string, Adapter>>
+  adapterDefaults?: AdapterResolverOptions
 }
 
 const HELP_TEXT = [
@@ -87,7 +88,7 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
       config: loaded.config,
       roleName,
       target,
-      resolveAdapter: createAdapterResolver(deps.adapterOverrides),
+      resolveAdapter: createAdapterResolver(deps.adapterOverrides, deps.adapterDefaults),
       cwd: parsed.values.cwd ? path.resolve(parsed.values.cwd) : undefined,
       timeoutMs,
       sessionId: parsed.values.session,
