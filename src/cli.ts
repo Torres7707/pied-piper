@@ -5,7 +5,9 @@ import { fileURLToPath } from 'node:url'
 import { parseArgs } from 'node:util'
 import { createAdapterResolver, execSubprocess, type Adapter, type AdapterResolverOptions } from './adapters.js'
 import { loadConfig } from './config.js'
+import { createJsonlEventLog, type EventLog } from './event-log.js'
 import { createGhGitHubPort, type GitHubPort } from './github.js'
+import { createNotifier, type Notifier } from './notifications.js'
 import { runRole } from './runner.js'
 import { isGitRepo } from './worktree.js'
 
@@ -17,6 +19,8 @@ export interface CliDeps {
   adapterDefaults?: AdapterResolverOptions
   github?: GitHubPort
   worktreeBaseDir?: string
+  eventLog?: EventLog
+  notifier?: Notifier
 }
 
 const HELP_TEXT = [
@@ -102,6 +106,15 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
     }
 
     const github = deps.github ?? (await resolveDefaultGitHubPort(repoRoot))
+    const eventLog =
+      deps.eventLog ??
+      createJsonlEventLog(path.resolve(repoRoot, loaded.config.runtime.eventLog.path))
+    const notifier =
+      deps.notifier ??
+      createNotifier({
+        config: loaded.config.runtime.notifications,
+        github,
+      })
 
     const result = await runRole({
       repoRoot,
@@ -114,6 +127,8 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
       sessionId: parsed.values.session,
       github,
       worktreeBaseDir: deps.worktreeBaseDir,
+      eventLog,
+      notifier,
     })
 
     if (result.reply.length > 0) {

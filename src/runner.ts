@@ -3,7 +3,9 @@ import { chmod, mkdir, readFile, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import type { AdapterResolver, AdapterUsage } from './adapters.js'
 import type { AccessMode, AdapterType, PiedPiperConfig, RoleConfig } from './config.js'
+import type { EventLog } from './event-log.js'
 import type { GitHubIssue, GitHubPort, GitHubPullRequest } from './github.js'
+import type { Notifier } from './notifications.js'
 import {
   hasAheadCommits,
   isGitRepo,
@@ -32,6 +34,9 @@ export interface RunRoleInput {
   worktreeBaseDir?: string
   baseBranch?: string
   publishReview?: boolean
+  eventLog?: EventLog
+  notifier?: Notifier
+  hop?: number
 }
 
 export interface RunRoleResult {
@@ -350,62 +355,116 @@ export async function runRole(input: RunRoleInput): Promise<RunRoleResult> {
       ? undefined
       : input.sessionId
 
-  const adapter = input.resolveAdapter(input.roleName, roleConfig)
-  const response = await adapter.run({
-    prompt,
-    cwd,
-    model: roleConfig.model,
-    sessionId: effectiveSessionId,
-    access: roleConfig.access,
-    timeoutMs,
-  })
-
-  let pullRequestNumber = materialized?.pullRequest?.number
-  if (
-    input.github &&
-    roleConfig.access === 'write' &&
-    parsedTarget.kind === 'issue' &&
-    worktreePath &&
-    branchName &&
-    baseBranch
-  ) {
-    pullRequestNumber = await ensurePullRequestForTicket({
-      github: input.github,
-      worktreePath,
-      branchName,
-      baseBranch,
-      issueNumber: parsedTarget.number,
-      issue: materialized?.issue,
-    })
-  }
-
-  if (
-    input.github &&
-    roleConfig.access === 'read' &&
-    parsedTarget.kind === 'pr' &&
-    input.publishReview !== false &&
-    response.reply.trim().length > 0
-  ) {
-    await input.github.submitPullRequestReview(parsedTarget.number, {
-      body: response.reply,
-      event: 'COMMENT',
-    })
-  }
-
-  return {
-    roleName: input.roleName,
+  await input.eventLog?.append({
+    timestamp: new Date().toISOString(),
+    type: 'run.started',
+    role: input.roleName,
     target: parsedTarget.label,
     adapter: roleConfig.adapter,
     model: roleConfig.model,
-    access: roleConfig.access,
-    cwd,
-    prompt,
-    reply: response.reply,
-    sessionId: response.sessionId,
-    usage: response.usage,
-    worktreePath,
-    branchName,
-    pullRequestNumber,
-    contextFiles: materialized?.contextPaths,
+    status: 'started',
+    hop: input.hop,
+  })
+
+  try {
+    const adapter = input.resolveAdapter(input.roleName, roleConfig)
+    const response = await adapter.run({
+      prompt,
+      cwd,
+      model: roleConfig.model,
+      sessionId: effectiveSessionId,
+      access: roleConfig.access,
+      timeoutMs,
+    })
+
+    let pullRequestNumber = materialized?.pullRequest?.number
+    if (
+      input.github &&
+      roleConfig.access === 'write' &&
+      parsedTarget.kind === 'issue' &&
+      worktreePath &&
+      branchName &&
+      baseBranch
+    ) {
+      pullRequestNumber = await ensurePullRequestForTicket({
+        github: input.github,
+        worktreePath,
+        branchName,
+        baseBranch,
+        issueNumber: parsedTarget.number,
+        issue: materialized?.issue,
+      })
+    }
+
+    if (
+      input.github &&
+      roleConfig.access === 'read' &&
+      parsedTarget.kind === 'pr' &&
+      input.publishReview !== false &&
+      response.reply.trim().length > 0
+    ) {
+      await input.github.submitPullRequestReview(parsedTarget.number, {
+        body: response.reply,
+        event: 'COMMENT',
+      })
+    }
+
+    await input.eventLog?.append({
+      timestamp: new Date().toISOString(),
+      type: 'run.completed',
+      role: input.roleName,
+      target: parsedTarget.label,
+      adapter: roleConfig.adapter,
+      model: roleConfig.model,
+      status: 'ok',
+      usage: response.usage,
+      sessionId: response.sessionId,
+      pullRequestNumber,
+      decision: pullRequestNumber ? `pr:#${pullRequestNumber}` : 'completed',
+      hop: input.hop,
+    })
+
+    return {
+      roleName: input.roleName,
+      target: parsedTarget.label,
+      adapter: roleConfig.adapter,
+      model: roleConfig.model,
+      access: roleConfig.access,
+      cwd,
+      prompt,
+      reply: response.reply,
+      sessionId: response.sessionId,
+      usage: response.usage,
+      worktreePath,
+      branchName,
+      pullRequestNumber,
+      contextFiles: materialized?.contextPaths,
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    await input.eventLog
+      ?.append({
+        timestamp: new Date().toISOString(),
+        type: 'run.failed',
+        role: input.roleName,
+        target: parsedTarget.label,
+        adapter: roleConfig.adapter,
+        model: roleConfig.model,
+        status: 'failed',
+        error: message,
+        hop: input.hop,
+      })
+      .catch(() => {})
+
+    await input.notifier
+      ?.notify({
+        title: `Pied Piper run failed (${input.roleName} -> ${parsedTarget.label})`,
+        body: message,
+        reason: 'run_failed',
+        targetNumber: parsedTarget.kind === 'raw' ? undefined : parsedTarget.number,
+      })
+      .catch(() => {})
+
+    throw error
   }
 }
