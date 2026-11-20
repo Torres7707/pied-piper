@@ -1,0 +1,72 @@
+{
+  "roles": {
+    "richard": {
+      "adapter": "claude",
+      "model": "claude-opus-5-5",
+      "skills": [
+        "grilling",
+        "domain-modeling",
+        "prototype",
+        "research"
+      ],
+      "parallel": 1,
+      "access": "read",
+      "prompt": "roles/richard.md"
+    },
+    "jared": {
+      "adapter": "claude",
+      "model": "claude-sonnet-5-5",
+      "skills": [
+        "to-spec",
+        "to-tickets",
+        "triage",
+        "domain-modeling"
+      ],
+      "parallel": 1,
+      "access": "read",
+      "prompt": "roles/jared.md"
+    },
+    "dinesh": {
+      "adapter": "claude",
+      "model": "claude-sonnet-5-5",
+      "skills": [
+        "tdd",
+        "diagnosing-bugs",
+        "codebase-design"
+      ],
+      "parallel": 2,
+      "access": "write",
+      "prompt": "roles/dinesh.md"
+    },
+    "gilfoyle": {
+      "adapter": "codex",
+      "model": "gpt-5-codex",
+      "skills": [
+        "code-review",
+        "pr"
+      ],
+      "parallel": 1,
+      "access": "read",
+      "prompt": "roles/gilfoyle.md"
+    }
+  },
+  "runtime": {
+    "notifications": {
+      "desktop": true,
+      "githubMention": false,
+      "githubHandle": ""
+    },
+    "review": {
+      "maxRounds": 2,
+      "validateOutput": true
+    },
+    "dispatcher": {
+      "maxHops": 8,
+      "pollIntervalSec": 60
+    },
+    "eventLog": {
+      "type": "jsonl",
+      "path": ".piedpiper/events.jsonl"
+    }
+  }
+}
