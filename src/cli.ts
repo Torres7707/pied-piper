@@ -3,9 +3,11 @@ import { realpathSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { parseArgs } from 'node:util'
-import { createAdapterResolver, type Adapter, type AdapterResolverOptions } from './adapters.js'
+import { createAdapterResolver, execSubprocess, type Adapter, type AdapterResolverOptions } from './adapters.js'
 import { loadConfig } from './config.js'
+import { createGhGitHubPort, type GitHubPort } from './github.js'
 import { runRole } from './runner.js'
+import { isGitRepo } from './worktree.js'
 
 export interface CliDeps {
   cwd?: string
@@ -13,6 +15,8 @@ export interface CliDeps {
   stderr?: (text: string) => void
   adapterOverrides?: Partial<Record<string, Adapter>>
   adapterDefaults?: AdapterResolverOptions
+  github?: GitHubPort
+  worktreeBaseDir?: string
 }
 
 const HELP_TEXT = [
@@ -26,6 +30,20 @@ const HELP_TEXT = [
   '  --session <id>     Optional session ID to resume',
   '  -h, --help         Show this help message',
 ].join('\n')
+
+async function resolveDefaultGitHubPort(repoRoot: string): Promise<GitHubPort | undefined> {
+  if (!(await isGitRepo(repoRoot))) {
+    return undefined
+  }
+  const remote = await execSubprocess('git', ['remote', 'get-url', 'origin'], {
+    cwd: repoRoot,
+    timeoutMs: 5000,
+  }).catch(() => undefined)
+  if (!remote || remote.exitCode !== 0 || !remote.stdout.includes('github.com')) {
+    return undefined
+  }
+  return createGhGitHubPort({ cwd: repoRoot })
+}
 
 function parseTimeoutOption(raw: string | undefined): number | undefined {
   if (raw === undefined) {
@@ -83,6 +101,8 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
       stderr(`${warning}\n`)
     }
 
+    const github = deps.github ?? (await resolveDefaultGitHubPort(repoRoot))
+
     const result = await runRole({
       repoRoot,
       config: loaded.config,
@@ -92,6 +112,8 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
       cwd: parsed.values.cwd ? path.resolve(parsed.values.cwd) : undefined,
       timeoutMs,
       sessionId: parsed.values.session,
+      github,
+      worktreeBaseDir: deps.worktreeBaseDir,
     })
 
     if (result.reply.length > 0) {
