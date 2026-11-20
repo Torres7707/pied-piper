@@ -1,9 +1,17 @@
+import { randomUUID } from 'node:crypto'
+import { chmod, mkdir, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import type { AdapterResolver } from './adapters.js'
 import type { PiedPiperConfig } from './config.js'
 import type { EventLog } from './event-log.js'
-import type { GitHubIssue, GitHubPort, GitHubPullRequest } from './github.js'
+import type { GitHubIssue, GitHubPort, GitHubPullRequest, GitHubReview } from './github.js'
 import type { Notifier } from './notifications.js'
+import {
+  formatBlockingFindingsContext,
+  validateGilfoyleOutput,
+  type ReviewFinding,
+  type ReviewValidationResult,
+} from './review.js'
 import { runRole } from './runner.js'
 
 export interface DispatchOnceInput {
@@ -25,6 +33,7 @@ export interface DispatchOnceResult {
   dispatchedDinesh: number[]
   dispatchedGilfoyle: number[]
   transitionedToReview: number[]
+  escalatedToHuman: number[]
   errors: string[]
 }
 
@@ -60,37 +69,109 @@ function getParentIdsWithOpenChildren(openIssues: GitHubIssue[]): Set<number> {
   return parents
 }
 
-async function transitionIssueToReview(
-  github: GitHubPort,
-  issue: GitHubIssue,
-  eventLog?: EventLog,
-  hop?: number,
-): Promise<boolean> {
-  if (issue.labels.includes('ready-for-human')) {
+async function setIssueLabelState(params: {
+  github: GitHubPort
+  issue: GitHubIssue
+  add: string[]
+  remove: string[]
+  decision: string
+  eventLog?: EventLog
+  hop?: number
+}): Promise<boolean> {
+  const { github, issue, add, remove, decision, eventLog, hop } = params
+  const toRemove = remove.filter((l) => issue.labels.includes(l))
+  const toAdd = add.filter((l) => !issue.labels.includes(l))
+  if (toRemove.length === 0 && toAdd.length === 0) {
     return false
   }
-  const hadInProgress = issue.labels.includes('in-progress')
-  const needsInReview = !issue.labels.includes('in-review')
-  if (!hadInProgress && !needsInReview) {
-    return false
+  if (toRemove.length > 0) {
+    await github.removeLabels(issue.number, toRemove)
+    const removeSet = new Set(toRemove)
+    issue.labels = issue.labels.filter((l) => !removeSet.has(l))
   }
-
-  if (hadInProgress) {
-    await github.removeLabels(issue.number, ['in-progress'])
-  }
-  if (needsInReview) {
-    await github.addLabels(issue.number, ['in-review'])
+  if (toAdd.length > 0) {
+    await github.addLabels(issue.number, toAdd)
+    issue.labels.push(...toAdd)
   }
   await eventLog?.append({
     timestamp: new Date().toISOString(),
     type: 'label.transitioned',
     target: `#${issue.number}`,
-    fromLabel: hadInProgress ? 'in-progress' : undefined,
-    toLabel: 'in-review',
-    decision: 'pr_opened',
+    fromLabel: toRemove.join(',') || undefined,
+    toLabel: toAdd.join(',') || undefined,
+    decision,
     hop,
   })
   return true
+}
+
+async function escalateToHuman(params: {
+  github: GitHubPort
+  linkedIssues: GitHubIssue[]
+  prNumber: number
+  reason: string
+  body: string
+  eventType: 'review.escalated' | 'review.invalid'
+  eventLog?: EventLog
+  notifier?: Notifier
+  hop: number
+  escalatedToHuman: number[]
+}): Promise<void> {
+  const {
+    github,
+    linkedIssues,
+    prNumber,
+    reason,
+    body,
+    eventType,
+    eventLog,
+    notifier,
+    hop,
+    escalatedToHuman,
+  } = params
+
+  for (const issue of linkedIssues) {
+    await setIssueLabelState({
+      github,
+      issue,
+      add: ['ready-for-human'],
+      remove: ['in-review', 'in-progress'],
+      decision: reason,
+      eventLog,
+      hop,
+    })
+    escalatedToHuman.push(issue.number)
+  }
+
+  await eventLog?.append({
+    timestamp: new Date().toISOString(),
+    type: eventType,
+    target: `PR #${prNumber}`,
+    status: eventType === 'review.invalid' ? 'invalid' : 'halted',
+    decision: reason,
+    pullRequestNumber: prNumber,
+    hop,
+  })
+
+  await notifier?.notify({
+    title: `Pied Piper needs developer decision (PR #${prNumber})`,
+    body,
+    reason,
+    targetNumber: linkedIssues[0]?.number ?? prNumber,
+  })
+}
+
+async function writeBlockingFindingsFile(
+  repoRoot: string,
+  prNumber: number,
+  findings: ReviewFinding[],
+): Promise<string> {
+  const dir = path.join(repoRoot, '.piedpiper', 'tmp', `review-${prNumber}-${randomUUID()}`)
+  await mkdir(dir, { recursive: true })
+  const filePath = path.join(dir, `pr-${prNumber}-round-1-blocking-findings.md`)
+  await writeFile(filePath, formatBlockingFindingsContext(prNumber, findings), 'utf8')
+  await chmod(filePath, 0o444)
+  return filePath
 }
 
 async function haltDispatcher(params: {
@@ -138,6 +219,445 @@ async function inferChainHopFromLog(eventLog: EventLog | undefined): Promise<num
   return maxHop
 }
 
+function interpretReviewBody(body: string, validateOutput: boolean): ReviewValidationResult {
+  const parsed = validateGilfoyleOutput(body)
+  if (!validateOutput) {
+    return {
+      valid: true,
+      approved: parsed.blockingFindings.length === 0,
+      blockingFindings: parsed.blockingFindings,
+      advisoryFindings: parsed.advisoryFindings,
+    }
+  }
+  return parsed
+}
+
+interface ValidatedGilfoyleAttempt {
+  halted: boolean
+  valid: boolean
+  reply?: string
+  validation?: ReviewValidationResult
+  hop: number
+  error?: string
+}
+
+async function runGilfoyleWithValidation(params: {
+  input: DispatchOnceInput
+  prNumber: number
+  linkedIssues: GitHubIssue[]
+  round: number
+  extraContextPaths?: string[]
+  extraInstructions?: string[]
+  hop: number
+  escalatedToHuman: number[]
+}): Promise<ValidatedGilfoyleAttempt> {
+  const { input, prNumber, linkedIssues, round, extraContextPaths, extraInstructions, escalatedToHuman } =
+    params
+  const { repoRoot, config, github, resolveAdapter, eventLog, notifier } = input
+  const maxHops = config.runtime.dispatcher.maxHops
+  const validateOutput = config.runtime.review.validateOutput
+  let hop = params.hop
+
+  const maxAttempts = validateOutput ? 2 : 1
+  let lastReason = 'Invalid Gilfoyle review output'
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    if (hop >= maxHops) {
+      await haltDispatcher({
+        hop,
+        maxHops,
+        targetNumber: linkedIssues[0]?.number ?? prNumber,
+        eventLog,
+        notifier,
+      })
+      return { halted: true, valid: false, hop }
+    }
+
+    hop += 1
+    const attemptInstructions = [
+      ...(extraInstructions ?? []),
+      ...(attempt > 1
+        ? [
+            'Previous output failed structural validation. You MUST provide at least one concrete finding (file:line, rationale, [阻塞级]/[建议级]) OR an explicit justified approval with checked file scope and acceptance criteria.',
+          ]
+        : []),
+    ]
+
+    let reply: string
+    try {
+      const result = await runRole({
+        repoRoot,
+        config,
+        roleName: 'gilfoyle',
+        target: `PR #${prNumber}`,
+        resolveAdapter,
+        timeoutMs: input.timeoutMs,
+        github,
+        publishReview: false,
+        extraContextPaths,
+        extraInstructions: attemptInstructions.length > 0 ? attemptInstructions : undefined,
+        eventLog,
+        notifier,
+        hop,
+      })
+      reply = result.reply
+    } catch (error) {
+      return {
+        halted: false,
+        valid: false,
+        hop,
+        error: error instanceof Error ? error.message : String(error),
+      }
+    }
+
+    const validation = interpretReviewBody(reply, validateOutput)
+    if (validation.valid) {
+      await github.submitPullRequestReview(prNumber, {
+        body: reply,
+        event: validation.blockingFindings.length > 0 ? 'REQUEST_CHANGES' : 'COMMENT',
+      })
+      return { halted: false, valid: true, reply, validation, hop }
+    }
+
+    lastReason = validation.reason ?? lastReason
+    await eventLog?.append({
+      timestamp: new Date().toISOString(),
+      type: 'review.invalid',
+      role: 'gilfoyle',
+      target: `PR #${prNumber}`,
+      status: 'invalid',
+      decision: `round=${round} attempt=${attempt}: ${lastReason}`,
+      pullRequestNumber: prNumber,
+      hop,
+    })
+  }
+
+  await escalateToHuman({
+    github,
+    linkedIssues,
+    prNumber,
+    reason: `invalid_review_output: ${lastReason}`,
+    body: `Gilfoyle round ${round} output failed validation after retries: ${lastReason}`,
+    eventType: 'review.invalid',
+    eventLog,
+    notifier,
+    hop,
+    escalatedToHuman,
+  })
+  return { halted: false, valid: false, hop }
+}
+
+async function processPrReviewLoop(params: {
+  input: DispatchOnceInput
+  pr: GitHubPullRequest
+  linkedIssues: GitHubIssue[]
+  hop: number
+  dispatchedDinesh: number[]
+  dispatchedGilfoyle: number[]
+  transitionedToReview: number[]
+  escalatedToHuman: number[]
+  errors: string[]
+}): Promise<{ halted: boolean; hop: number }> {
+  const {
+    input,
+    pr,
+    linkedIssues,
+    dispatchedDinesh,
+    dispatchedGilfoyle,
+    transitionedToReview,
+    escalatedToHuman,
+    errors,
+  } = params
+  const { repoRoot, config, github, resolveAdapter, eventLog, notifier } = input
+  const maxRounds = config.runtime.review.maxRounds
+  const maxHops = config.runtime.dispatcher.maxHops
+  const validateOutput = config.runtime.review.validateOutput
+  let hop = params.hop
+
+  if (linkedIssues.some((i) => i.labels.includes('ready-for-human'))) {
+    return { halted: false, hop }
+  }
+
+  const existingReviews: GitHubReview[] = await github.listPullRequestReviews(pr.number)
+
+  // Already reviewed at least once: decide whether it's approved, awaiting Round 2, or ready to escalate.
+  if (existingReviews.length > 0) {
+    const latest = existingReviews.at(-1)!
+    const latestParsed = interpretReviewBody(latest.body, validateOutput)
+    if (latestParsed.blockingFindings.length === 0) {
+      return { halted: false, hop }
+    }
+
+    if (existingReviews.length >= maxRounds) {
+      await escalateToHuman({
+        github,
+        linkedIssues,
+        prNumber: pr.number,
+        reason: `blocking_findings_after_${existingReviews.length}_rounds`,
+        body: `PR #${pr.number} still has ${latestParsed.blockingFindings.length} blocking finding(s) after ${existingReviews.length} review rounds.`,
+        eventType: 'review.escalated',
+        eventLog,
+        notifier,
+        hop,
+        escalatedToHuman,
+      })
+      return { halted: false, hop }
+    }
+
+    // Round 1 had blocking findings and we have not run Round 2 yet.
+    const blockingFile = await writeBlockingFindingsFile(
+      repoRoot,
+      pr.number,
+      latestParsed.blockingFindings,
+    )
+
+    // If any linked issue is still in-progress, run Dinesh fix first before Round 2 review.
+    const needsDineshFix = linkedIssues.some((i) => i.labels.includes('in-progress'))
+    if (needsDineshFix && config.roles.dinesh && linkedIssues[0]) {
+      if (hop >= maxHops) {
+        await haltDispatcher({
+          hop,
+          maxHops,
+          targetNumber: linkedIssues[0].number,
+          eventLog,
+          notifier,
+        })
+        return { halted: true, hop }
+      }
+      hop += 1
+      dispatchedDinesh.push(linkedIssues[0].number)
+      try {
+        await runRole({
+          repoRoot,
+          config,
+          roleName: 'dinesh',
+          target: `#${linkedIssues[0].number}`,
+          resolveAdapter,
+          worktreeBaseDir: input.worktreeBaseDir,
+          baseBranch: input.baseBranch,
+          timeoutMs: input.timeoutMs,
+          github,
+          extraContextPaths: [blockingFile],
+          extraInstructions: [
+            'Address ONLY the Round 1 blocking findings listed in the context file and commit updates to the PR branch.',
+          ],
+          eventLog,
+          notifier,
+          hop,
+        })
+        for (const issue of linkedIssues) {
+          const moved = await setIssueLabelState({
+            github,
+            issue,
+            add: ['in-review'],
+            remove: ['in-progress'],
+            decision: 'round1_fixes_pushed',
+            eventLog,
+            hop,
+          })
+          if (moved) transitionedToReview.push(issue.number)
+        }
+      } catch (error) {
+        errors.push(error instanceof Error ? error.message : String(error))
+        return { halted: false, hop }
+      }
+    }
+
+    if (!config.roles.gilfoyle) return { halted: false, hop }
+    const round2 = await runGilfoyleWithValidation({
+      input,
+      prNumber: pr.number,
+      linkedIssues,
+      round: existingReviews.length + 1,
+      extraContextPaths: [blockingFile],
+      extraInstructions: [
+        'Review Round 2: Verify ONLY whether the Round 1 blocking findings in the context file have been resolved (and check direct regressions). Do not expand scope.',
+      ],
+      hop,
+      escalatedToHuman,
+    })
+    hop = round2.hop
+    if (round2.error) errors.push(round2.error)
+    if (round2.halted) return { halted: true, hop }
+    if (round2.valid) {
+      dispatchedGilfoyle.push(pr.number)
+      if ((round2.validation?.blockingFindings.length ?? 0) > 0 && existingReviews.length + 1 >= maxRounds) {
+        await escalateToHuman({
+          github,
+          linkedIssues,
+          prNumber: pr.number,
+          reason: `blocking_findings_after_${maxRounds}_rounds`,
+          body: `PR #${pr.number} still has blocking findings after Round ${maxRounds}. Manual developer decision required.`,
+          eventType: 'review.escalated',
+          eventLog,
+          notifier,
+          hop,
+          escalatedToHuman,
+        })
+      }
+    }
+    return { halted: false, hop }
+  }
+
+  // Round 1: PR has 0 reviews yet. Ensure linked issues are marked in-review, then run Gilfoyle.
+  for (const issue of linkedIssues) {
+    const moved = await setIssueLabelState({
+      github,
+      issue,
+      add: ['in-review'],
+      remove: ['in-progress'],
+      decision: 'pr_opened',
+      eventLog,
+      hop,
+    })
+    if (moved) transitionedToReview.push(issue.number)
+  }
+
+  if (!config.roles.gilfoyle) return { halted: false, hop }
+
+  const round1 = await runGilfoyleWithValidation({
+    input,
+    prNumber: pr.number,
+    linkedIssues,
+    round: 1,
+    hop,
+    escalatedToHuman,
+  })
+  hop = round1.hop
+  if (round1.error) errors.push(round1.error)
+  if (round1.halted) return { halted: true, hop }
+  if (!round1.valid || !round1.validation) return { halted: false, hop }
+
+  dispatchedGilfoyle.push(pr.number)
+
+  // Approved or advisory-only -> end automatic loop without merging.
+  if (round1.validation.blockingFindings.length === 0) {
+    return { halted: false, hop }
+  }
+
+  if (maxRounds <= 1) {
+    await escalateToHuman({
+      github,
+      linkedIssues,
+      prNumber: pr.number,
+      reason: 'blocking_findings_after_1_round',
+      body: `PR #${pr.number} has blocking findings and maxRounds=1.`,
+      eventType: 'review.escalated',
+      eventLog,
+      notifier,
+      hop,
+      escalatedToHuman,
+    })
+    return { halted: false, hop }
+  }
+
+  // Round 1 blocking findings -> send back to Dinesh for targeted fix, then run Round 2 Gilfoyle.
+  const blockingFile = await writeBlockingFindingsFile(
+    repoRoot,
+    pr.number,
+    round1.validation.blockingFindings,
+  )
+
+  if (config.roles.dinesh && linkedIssues[0]) {
+    if (hop >= maxHops) {
+      await haltDispatcher({
+        hop,
+        maxHops,
+        targetNumber: linkedIssues[0].number,
+        eventLog,
+        notifier,
+      })
+      return { halted: true, hop }
+    }
+
+    for (const issue of linkedIssues) {
+      await setIssueLabelState({
+        github,
+        issue,
+        add: ['in-progress'],
+        remove: ['in-review'],
+        decision: 'round1_blocking_findings',
+        eventLog,
+        hop,
+      })
+    }
+
+    hop += 1
+    dispatchedDinesh.push(linkedIssues[0].number)
+    try {
+      await runRole({
+        repoRoot,
+        config,
+        roleName: 'dinesh',
+        target: `#${linkedIssues[0].number}`,
+        resolveAdapter,
+        worktreeBaseDir: input.worktreeBaseDir,
+        baseBranch: input.baseBranch,
+        timeoutMs: input.timeoutMs,
+        github,
+        extraContextPaths: [blockingFile],
+        extraInstructions: [
+          'Address ONLY the Round 1 blocking findings listed in the context file and commit updates to the PR branch.',
+        ],
+        eventLog,
+        notifier,
+        hop,
+      })
+    } catch (error) {
+      errors.push(error instanceof Error ? error.message : String(error))
+      return { halted: false, hop }
+    }
+
+    for (const issue of linkedIssues) {
+      const moved = await setIssueLabelState({
+        github,
+        issue,
+        add: ['in-review'],
+        remove: ['in-progress'],
+        decision: 'round1_fixes_pushed',
+        eventLog,
+        hop,
+      })
+      if (moved) transitionedToReview.push(issue.number)
+    }
+  }
+
+  const round2 = await runGilfoyleWithValidation({
+    input,
+    prNumber: pr.number,
+    linkedIssues,
+    round: 2,
+    extraContextPaths: [blockingFile],
+    extraInstructions: [
+      'Review Round 2: Verify ONLY whether the Round 1 blocking findings in the context file have been resolved (and check direct regressions). Do not expand scope.',
+    ],
+    hop,
+    escalatedToHuman,
+  })
+  hop = round2.hop
+  if (round2.error) errors.push(round2.error)
+  if (round2.halted) return { halted: true, hop }
+  if (round2.valid) {
+    dispatchedGilfoyle.push(pr.number)
+    if ((round2.validation?.blockingFindings.length ?? 0) > 0 && 2 >= maxRounds) {
+      await escalateToHuman({
+        github,
+        linkedIssues,
+        prNumber: pr.number,
+        reason: `blocking_findings_after_${maxRounds}_rounds`,
+        body: `PR #${pr.number} still has blocking findings after ${maxRounds} review rounds. Manual developer decision required.`,
+        eventType: 'review.escalated',
+        eventLog,
+        notifier,
+        hop,
+        escalatedToHuman,
+      })
+    }
+  }
+
+  return { halted: false, hop }
+}
+
 /**
  * Executes one stateless scheduling cycle using GitHub as the authoritative state source.
  */
@@ -174,6 +694,7 @@ export async function dispatchOnce(input: DispatchOnceInput): Promise<DispatchOn
       dispatchedDinesh: [],
       dispatchedGilfoyle: [],
       transitionedToReview: [],
+      escalatedToHuman: [],
       errors: [],
     }
   }
@@ -181,66 +702,38 @@ export async function dispatchOnce(input: DispatchOnceInput): Promise<DispatchOn
   const dispatchedDinesh: number[] = []
   const dispatchedGilfoyle: number[] = []
   const transitionedToReview: number[] = []
+  const escalatedToHuman: number[] = []
   const errors: string[] = []
-  const reviewedPrsThisCycle = new Set<number>()
+  const processedPrsThisCycle = new Set<number>()
 
-  // Step 1: Reconcile open PRs (transition linked issues to in-review and trigger Gilfoyle if unreviewed).
+  // Step 1: Process existing open PRs (review transitions, Round 1/2 loop, and escalation).
   for (const pr of openPrs) {
-    let anyHumanEscalated = false
-    for (const issueNum of pr.linkedIssueNumbers) {
-      const linked = issueByNumber.get(issueNum)
-      if (!linked) continue
-      if (linked.labels.includes('ready-for-human')) {
-        anyHumanEscalated = true
-        continue
-      }
-      const transitioned = await transitionIssueToReview(github, linked, eventLog, currentHop)
-      if (transitioned) {
-        transitionedToReview.push(issueNum)
-        linked.labels = linked.labels.filter((l) => l !== 'in-progress')
-        if (!linked.labels.includes('in-review')) linked.labels.push('in-review')
-      }
-    }
+    const linkedIssues = pr.linkedIssueNumbers
+      .map((num) => issueByNumber.get(num))
+      .filter((issue): issue is GitHubIssue => issue !== undefined)
 
-    if (anyHumanEscalated || !config.roles.gilfoyle) continue
-
-    const existingReviews = await github.listPullRequestReviews(pr.number)
-    if (existingReviews.length === 0) {
-      if (currentHop >= maxHops) {
-        await haltDispatcher({
-          hop: currentHop,
-          maxHops,
-          targetNumber: pr.linkedIssueNumbers[0] ?? pr.number,
-          eventLog,
-          notifier,
-        })
-        return {
-          halted: true,
-          frontierIssues: frontier.map((i) => i.number),
-          dispatchedDinesh,
-          dispatchedGilfoyle,
-          transitionedToReview,
-          errors,
-        }
-      }
-      currentHop += 1
-      try {
-        await runRole({
-          repoRoot,
-          config,
-          roleName: 'gilfoyle',
-          target: `PR #${pr.number}`,
-          resolveAdapter,
-          timeoutMs: input.timeoutMs,
-          github,
-          eventLog,
-          notifier,
-          hop: currentHop,
-        })
-        dispatchedGilfoyle.push(pr.number)
-        reviewedPrsThisCycle.add(pr.number)
-      } catch (error) {
-        errors.push(error instanceof Error ? error.message : String(error))
+    processedPrsThisCycle.add(pr.number)
+    const outcome = await processPrReviewLoop({
+      input,
+      pr,
+      linkedIssues,
+      hop: currentHop,
+      dispatchedDinesh,
+      dispatchedGilfoyle,
+      transitionedToReview,
+      escalatedToHuman,
+      errors,
+    })
+    currentHop = outcome.hop
+    if (outcome.halted) {
+      return {
+        halted: true,
+        frontierIssues: frontier.map((i) => i.number),
+        dispatchedDinesh,
+        dispatchedGilfoyle,
+        transitionedToReview,
+        escalatedToHuman,
+        errors,
       }
     }
   }
@@ -258,15 +751,13 @@ export async function dispatchOnce(input: DispatchOnceInput): Promise<DispatchOn
     for (const candidate of frontier) {
       if (toClaim.length >= remainingSlots) break
       if (currentHop + toClaim.length >= maxHops) break
-      await github.addLabels(candidate.number, ['in-progress'])
-      candidate.labels.push('in-progress')
-      await eventLog?.append({
-        timestamp: new Date().toISOString(),
-        type: 'label.transitioned',
-        role: 'dinesh',
-        target: `#${candidate.number}`,
-        toLabel: 'in-progress',
+      await setIssueLabelState({
+        github,
+        issue: candidate,
+        add: ['in-progress'],
+        remove: [],
         decision: 'claimed_frontier',
+        eventLog,
         hop: currentHop + toClaim.length + 1,
       })
       toClaim.push(candidate)
@@ -286,6 +777,7 @@ export async function dispatchOnce(input: DispatchOnceInput): Promise<DispatchOn
         dispatchedDinesh,
         dispatchedGilfoyle,
         transitionedToReview,
+        escalatedToHuman,
         errors,
       }
     }
@@ -321,58 +813,40 @@ export async function dispatchOnce(input: DispatchOnceInput): Promise<DispatchOn
       }),
     )
 
-    // Step 3: For Dinesh runs that opened a PR, transition to in-review and trigger Gilfoyle.
+    // Step 3: For newly opened PRs, transition to in-review and drive the bounded review loop.
     for (const outcome of dineshOutcomes) {
       if (outcome.error) {
         errors.push(outcome.error)
         continue
       }
       const prNum = outcome.result?.pullRequestNumber
-      if (prNum === undefined || reviewedPrsThisCycle.has(prNum)) {
+      if (prNum === undefined || processedPrsThisCycle.has(prNum)) {
         continue
       }
-      const transitioned = await transitionIssueToReview(github, outcome.issue, eventLog, currentHop)
-      if (transitioned) {
-        transitionedToReview.push(outcome.issue.number)
-      }
-      if (!config.roles.gilfoyle) continue
-
-      if (currentHop >= maxHops) {
-        await haltDispatcher({
-          hop: currentHop,
-          maxHops,
-          targetNumber: outcome.issue.number,
-          eventLog,
-          notifier,
-        })
+      processedPrsThisCycle.add(prNum)
+      const pr = await github.getPullRequest(prNum)
+      const loopResult = await processPrReviewLoop({
+        input,
+        pr,
+        linkedIssues: [outcome.issue],
+        hop: currentHop,
+        dispatchedDinesh,
+        dispatchedGilfoyle,
+        transitionedToReview,
+        escalatedToHuman,
+        errors,
+      })
+      currentHop = loopResult.hop
+      if (loopResult.halted) {
         return {
           halted: true,
           frontierIssues: frontier.map((i) => i.number),
           dispatchedDinesh,
           dispatchedGilfoyle,
           transitionedToReview,
+          escalatedToHuman,
           errors,
         }
-      }
-
-      currentHop += 1
-      try {
-        await runRole({
-          repoRoot,
-          config,
-          roleName: 'gilfoyle',
-          target: `PR #${prNum}`,
-          resolveAdapter,
-          timeoutMs: input.timeoutMs,
-          github,
-          eventLog,
-          notifier,
-          hop: currentHop,
-        })
-        dispatchedGilfoyle.push(prNum)
-        reviewedPrsThisCycle.add(prNum)
-      } catch (error) {
-        errors.push(error instanceof Error ? error.message : String(error))
       }
     }
   }
@@ -383,6 +857,7 @@ export async function dispatchOnce(input: DispatchOnceInput): Promise<DispatchOn
     dispatchedDinesh,
     dispatchedGilfoyle,
     transitionedToReview,
+    escalatedToHuman,
     errors,
   }
 }

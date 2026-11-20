@@ -30,6 +30,7 @@ export interface RunRoleInput {
   timeoutMs?: number
   sessionId?: string
   extraContextPaths?: string[]
+  extraInstructions?: string[]
   github?: GitHubPort
   worktreeBaseDir?: string
   baseBranch?: string
@@ -206,6 +207,7 @@ function assemblePrompt(params: {
   parentSpecNumber?: number
   cwd: string
   extraContextPaths?: string[]
+  extraInstructions?: string[]
 }): string {
   const {
     roleName,
@@ -215,6 +217,7 @@ function assemblePrompt(params: {
     parentSpecNumber,
     cwd,
     extraContextPaths,
+    extraInstructions,
   } = params
 
   const skillLines =
@@ -235,6 +238,11 @@ function assemblePrompt(params: {
     ...(extraContextPaths ?? []).map((p) => `- Context file: ${p}`),
   ]
 
+  const extraSection =
+    extraInstructions && extraInstructions.length > 0
+      ? ['', '## Run-Specific Instructions', ...extraInstructions.map((line) => `- ${line}`)]
+      : []
+
   return [
     roleInstructions.trim(),
     '',
@@ -242,6 +250,7 @@ function assemblePrompt(params: {
     `- Role: ${roleName}`,
     `- ${accessRule}`,
     `- Working directory: ${cwd}`,
+    ...extraSection,
     '',
     '## Configured Skills',
     ...skillLines,
@@ -347,6 +356,7 @@ export async function runRole(input: RunRoleInput): Promise<RunRoleResult> {
     parentSpecNumber: materialized?.parentSpecNumber,
     cwd,
     extraContextPaths,
+    extraInstructions: input.extraInstructions,
   })
 
   // Blind review isolation: read-only reviewers (e.g. Gilfoyle) never inherit a caller sessionId unless explicitly provided for that reviewer.
