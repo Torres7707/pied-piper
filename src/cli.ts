@@ -9,7 +9,7 @@ import { dispatchOnce, dispatchPoll, resolveDefaultEventLogPath } from './dispat
 import { createJsonlEventLog, type EventLog } from './event-log.js'
 import { createGhGitHubPort, type GitHubPort } from './github.js'
 import { createNotifier, type Notifier } from './notifications.js'
-import { runRole } from './runner.js'
+import { formatPublishedTaskGraphSummary, runRole } from './runner.js'
 import { isGitRepo } from './worktree.js'
 
 export interface CliDeps {
@@ -207,6 +207,14 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
 
     if (result.reply.length > 0) {
       stdout(result.reply.endsWith('\n') ? result.reply : `${result.reply}\n`)
+    }
+    if (result.publishedSpecNumber !== undefined) {
+      stdout(
+        `${formatPublishedTaskGraphSummary(
+          result.publishedSpecNumber,
+          result.publishedTicketNumbers ?? [],
+        )}\n`,
+      )
     }
     return 0
   } catch (error) {

@@ -4,7 +4,8 @@ import path from 'node:path'
 import type { AdapterResolver, AdapterUsage } from './adapters.js'
 import type { AccessMode, AdapterType, PiedPiperConfig, RoleConfig } from './config.js'
 import type { EventLog } from './event-log.js'
-import type { GitHubIssue, GitHubPort, GitHubPullRequest } from './github.js'
+import type { GitHubIssue, GitHubLabelSpec, GitHubPort, GitHubPullRequest } from './github.js'
+import { STANDARD_GITHUB_LABELS } from './github.js'
 import type { Notifier } from './notifications.js'
 import {
   hasAheadCommits,
@@ -54,7 +55,26 @@ export interface RunRoleResult {
   worktreePath?: string
   branchName?: string
   pullRequestNumber?: number
+  publishedSpecNumber?: number
+  publishedTicketNumbers?: number[]
   contextFiles?: string[]
+}
+
+export interface JaredSpecDraft {
+  title: string
+  body: string
+}
+
+export interface JaredTicketDraft {
+  id: string
+  title: string
+  body: string
+  blockedBy: string[]
+}
+
+export interface JaredTaskGraph {
+  spec: JaredSpecDraft
+  tickets: JaredTicketDraft[]
 }
 
 /** Error raised when role execution setup or target validation fails. */
@@ -243,6 +263,18 @@ function assemblePrompt(params: {
       ? ['', '## Run-Specific Instructions', ...extraInstructions.map((line) => `- ${line}`)]
       : []
 
+  const jaredTaskGraphSection =
+    roleName === 'jared'
+      ? [
+          '',
+          '## Host Output Contract (Structured Task Graph)',
+          '- You are strictly read-only (`access: read`); never execute `gh issue create` or mutate GitHub directly.',
+          '- When you finish writing the Spec and vertical-slice Tickets, append a single fenced ```json block at the end of your reply with this exact shape:',
+          '  `{ "spec": { "title": "Spec: ...", "body": "..." }, "tickets": [{ "id": "t1", "title": "Ticket: ...", "body": "...", "blockedBy": [] }] }`',
+          '- The host process will validate the DAG and automatically create the parent Spec, sub-Tickets, `ready-for-agent` labels, and native `blockedBy` dependencies on GitHub.',
+        ]
+      : []
+
   return [
     roleInstructions.trim(),
     '',
@@ -251,6 +283,7 @@ function assemblePrompt(params: {
     `- ${accessRule}`,
     `- Working directory: ${cwd}`,
     ...extraSection,
+    ...jaredTaskGraphSection,
     '',
     '## Configured Skills',
     ...skillLines,
@@ -292,6 +325,226 @@ async function ensurePullRequestForTicket(params: {
     base: baseBranch,
   })
   return created.number
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function extractCandidateJsonTexts(reply: string): string[] {
+  const candidates: string[] = []
+
+  // 1. Per-fence lazy matches, last first: handles the common single-fence
+  //    case and distractor fences that appear before the graph.
+  const fencedMatches = [...reply.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi)]
+  for (let i = fencedMatches.length - 1; i >= 0; i--) {
+    const inner = fencedMatches[i]?.[1]?.trim()
+    if (inner) {
+      candidates.push(inner)
+    }
+  }
+
+  // 2. Whole-span candidates: when the graph JSON's string values embed inner
+  //    fenced code samples (```bash / ```ts), the lazy regex above splits the
+  //    block into unparseable fragments and the graph would be silently
+  //    dropped. Try the span from each fence occurrence to the final fence
+  //    close instead, stripping only the boundary fence markers: backticks are
+  //    legal characters inside JSON strings, so the graph's opening-fence span
+  //    parses with inner code fences preserved intact.
+  const fencePositions = [...reply.matchAll(/```/g)].map((m) => m.index ?? 0)
+  if (fencePositions.length >= 2) {
+    const spanEnd = fencePositions[fencePositions.length - 1]! + 3
+    for (const spanStart of fencePositions.slice(0, -1)) {
+      const stripped = reply
+        .slice(spanStart, spanEnd)
+        .replace(/^```(?:json)?\s*/, '')
+        .replace(/\s*```$/, '')
+        .trim()
+      if (stripped) {
+        candidates.push(stripped)
+      }
+    }
+  }
+
+  // 3. Bare JSON object without any fences.
+  const trimmed = reply.trim()
+  if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+    candidates.push(trimmed)
+  }
+  return candidates
+}
+
+/**
+ * Extracts and validates a Jared structured task graph (`spec` + topologically ordered `tickets`) from a reply.
+ * Returns `undefined` when the reply does not contain a task graph JSON block.
+ */
+export function parseAndValidateJaredTaskGraph(reply: string): JaredTaskGraph | undefined {
+  const candidates = extractCandidateJsonTexts(reply)
+  let rawGraph: Record<string, unknown> | undefined
+
+  for (const candidate of candidates) {
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(candidate)
+    } catch {
+      continue
+    }
+    if (isPlainRecord(parsed) && ('spec' in parsed || 'tickets' in parsed)) {
+      rawGraph = parsed
+      break
+    }
+  }
+
+  if (!rawGraph) {
+    return undefined
+  }
+
+  if (!isPlainRecord(rawGraph.spec)) {
+    throw new RunnerError('Invalid Jared task graph: missing "spec" object')
+  }
+  const specTitle =
+    typeof rawGraph.spec.title === 'string' ? rawGraph.spec.title.trim() : ''
+  const specBody =
+    typeof rawGraph.spec.body === 'string' ? rawGraph.spec.body.trim() : ''
+  if (!specTitle || !specBody) {
+    throw new RunnerError('Invalid Jared task graph: "spec.title" and "spec.body" must be non-empty strings')
+  }
+
+  if (!Array.isArray(rawGraph.tickets)) {
+    throw new RunnerError('Invalid Jared task graph: "tickets" must be an array')
+  }
+
+  const rawTickets: JaredTicketDraft[] = []
+  const ticketById = new Map<string, JaredTicketDraft>()
+
+  for (let index = 0; index < rawGraph.tickets.length; index++) {
+    const item = rawGraph.tickets[index]
+    if (!isPlainRecord(item)) {
+      throw new RunnerError(`Invalid Jared task graph: tickets[${index}] must be an object`)
+    }
+    const id = typeof item.id === 'string' ? item.id.trim() : ''
+    const title = typeof item.title === 'string' ? item.title.trim() : ''
+    const body = typeof item.body === 'string' ? item.body.trim() : ''
+    if (!id || !title || !body) {
+      throw new RunnerError(
+        `Invalid Jared task graph: tickets[${index}] must include non-empty "id", "title", and "body"`,
+      )
+    }
+    if (ticketById.has(id)) {
+      throw new RunnerError(`Duplicate ticket id "${id}" in Jared task graph`)
+    }
+
+    let blockedBy: string[] = []
+    if (item.blockedBy !== undefined) {
+      if (!Array.isArray(item.blockedBy)) {
+        throw new RunnerError(`Invalid Jared task graph: tickets[${index}].blockedBy must be an array of strings`)
+      }
+      blockedBy = [
+        ...new Set(
+          item.blockedBy.map((dep, depIdx) => {
+            if (typeof dep !== 'string' || dep.trim().length === 0) {
+              throw new RunnerError(
+                `Invalid Jared task graph: tickets[${index}].blockedBy[${depIdx}] must be a non-empty string`,
+              )
+            }
+            return dep.trim()
+          }),
+        ),
+      ]
+    }
+
+    const draft: JaredTicketDraft = { id, title, body, blockedBy }
+    rawTickets.push(draft)
+    ticketById.set(id, draft)
+  }
+
+  for (const ticket of rawTickets) {
+    for (const depId of ticket.blockedBy) {
+      if (!ticketById.has(depId)) {
+        throw new RunnerError(
+          `Unknown blockedBy ticket id "${depId}" referenced by ticket "${ticket.id}"`,
+        )
+      }
+    }
+  }
+
+  // Topological sort preserving original relative order for ready nodes, with cycle detection
+  const sorted: JaredTicketDraft[] = []
+  const emittedIds = new Set<string>()
+  const remaining = [...rawTickets]
+
+  while (remaining.length > 0) {
+    const readyIndex = remaining.findIndex((t) =>
+      t.blockedBy.every((depId) => emittedIds.has(depId)),
+    )
+    if (readyIndex === -1) {
+      const cycleIds = remaining.map((t) => t.id).join(', ')
+      throw new RunnerError(
+        `Circular dependency detected in Jared task graph involving tickets: ${cycleIds}`,
+      )
+    }
+    const [nextTicket] = remaining.splice(readyIndex, 1)
+    sorted.push(nextTicket!)
+    emittedIds.add(nextTicket!.id)
+  }
+
+  return {
+    spec: { title: specTitle, body: specBody },
+    tickets: sorted,
+  }
+}
+
+const JARED_PUBLISH_LABELS: readonly GitHubLabelSpec[] = STANDARD_GITHUB_LABELS.filter(
+  (label) => label.name === 'ready-for-agent',
+)
+
+async function publishJaredTaskGraph(
+  github: GitHubPort,
+  graph: JaredTaskGraph,
+): Promise<{ publishedSpecNumber: number; publishedTicketNumbers: number[] }> {
+  // ADR 0003: the host guarantees label consistency before any write, so `gh issue
+  // create --label ...` cannot abort on repos that have not pre-seeded the label.
+  await github.ensureLabels(JARED_PUBLISH_LABELS)
+
+  const specIssue = await github.createIssue({
+    title: graph.spec.title,
+    body: graph.spec.body,
+    labels: ['ready-for-agent'],
+  })
+
+  const idToIssueNumber = new Map<string, number>()
+  const publishedTicketNumbers: number[] = []
+
+  for (const ticket of graph.tickets) {
+    const blockedByNumbers = ticket.blockedBy.map((depId) => idToIssueNumber.get(depId)!)
+    const createdTicket = await github.createIssue({
+      title: ticket.title,
+      body: ticket.body,
+      labels: ['ready-for-agent'],
+      parentNumber: specIssue.number,
+      blockedByNumbers,
+    })
+    idToIssueNumber.set(ticket.id, createdTicket.number)
+    publishedTicketNumbers.push(createdTicket.number)
+  }
+
+  return {
+    publishedSpecNumber: specIssue.number,
+    publishedTicketNumbers,
+  }
+}
+
+/**
+ * Formats a concise human-readable summary of a Spec and Tickets published by Jared.
+ */
+export function formatPublishedTaskGraphSummary(
+  specNumber: number,
+  ticketNumbers: number[],
+): string {
+  if (ticketNumbers.length === 0) {
+    return `Published Spec #${specNumber}`
+  }
+  return `Published Spec #${specNumber} and Tickets ${ticketNumbers.map((n) => `#${n}`).join(', ')}`
 }
 
 /**
@@ -419,6 +672,24 @@ export async function runRole(input: RunRoleInput): Promise<RunRoleResult> {
       })
     }
 
+    let publishedSpecNumber: number | undefined
+    let publishedTicketNumbers: number[] | undefined
+    if (input.github && input.roleName === 'jared' && response.reply.trim().length > 0) {
+      const taskGraph = parseAndValidateJaredTaskGraph(response.reply)
+      if (taskGraph) {
+        const published = await publishJaredTaskGraph(input.github, taskGraph)
+        publishedSpecNumber = published.publishedSpecNumber
+        publishedTicketNumbers = published.publishedTicketNumbers
+      }
+    }
+
+    const decision =
+      pullRequestNumber !== undefined
+        ? `pr:#${pullRequestNumber}`
+        : publishedSpecNumber !== undefined
+          ? `spec:#${publishedSpecNumber}`
+          : 'completed'
+
     await input.eventLog?.append({
       timestamp: new Date().toISOString(),
       type: 'run.completed',
@@ -430,7 +701,7 @@ export async function runRole(input: RunRoleInput): Promise<RunRoleResult> {
       usage: response.usage,
       sessionId: response.sessionId,
       pullRequestNumber,
-      decision: pullRequestNumber ? `pr:#${pullRequestNumber}` : 'completed',
+      decision,
       hop: input.hop,
     })
 
@@ -448,6 +719,8 @@ export async function runRole(input: RunRoleInput): Promise<RunRoleResult> {
       worktreePath,
       branchName,
       pullRequestNumber,
+      publishedSpecNumber,
+      publishedTicketNumbers,
       contextFiles: materialized?.contextPaths,
     }
   } catch (error) {

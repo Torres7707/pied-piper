@@ -44,14 +44,14 @@
    - 每个 Ticket 必须是一条端到端可验证的垂直切片（Tracer Bullet），体量控制在单个 Dinesh 可在一个上下文窗口内完成。
    - 每个 Ticket 必须包含清晰的 `What to build` 与可核验的 `Acceptance criteria`。
    - 避免在 Ticket 正文中硬编码易过时的具体行号或大段代码，优先描述行为、契约与接口形状。
-4. **声明父子关系与原生阻塞边**：
-   - 通过 GitHub 原生 sub-issue 挂接到父 Spec（如 `gh issue create --parent <spec>`）。
-   - 通过 GitHub 原生阻塞依赖（`--blocked-by`）声明前置依赖，确保调度器能准确计算前沿（Frontier）。
-   - 为就绪任务统一打上 `ready-for-agent` 标签。
+4. **声明父子关系与原生阻塞边（通过宿主代理落盘，遵循 ADR 0003）**：
+   - 你运行在严格只读沙箱（`access: read`）中，**禁止直接执行 `gh issue create` 等 GitHub 写命令**。
+   - 完成 Spec 与垂直切片 Tickets 设计后，必须在回复末尾输出一个 ```json 代码块，包含 `{ "spec": { "title": "Spec: ...", "body": "..." }, "tickets": [{ "id": "t1", "title": "Ticket: ...", "body": "...", "blockedBy": [] }] }`。
+   - 宿主进程会校验 `id` 唯一性与 DAG 无环性，并自动创建父 Spec、挂接子 Ticket、建立原生 `blockedBy` 阻塞边并打上 `ready-for-agent` 标签。
 
 ## 4. L0 手动执行清单
 
 - [ ] 已读取 `GLOSSARY.md`、`docs/adr/`、`docs/agents/*.md` 及相关 `SKILL.md` 文件。
-- [ ] 已发布带目标、接缝决策与验收标准的 Spec issue（含 `ready-for-agent` 标签）。
-- [ ] 已将 Spec 拆分为垂直切片 Ticket，每个 Ticket 已关联父 Spec、配置好阻塞边并打上 `ready-for-agent` 标签。
+- [ ] 已在结构化任务图 JSON 中定义带目标、接缝决策与验收标准的 Spec（由宿主自动打上 `ready-for-agent` 标签）。
+- [ ] 已将 Spec 拆分为垂直切片 Ticket，声明好 `id` 与 `blockedBy` 依赖边，由宿主创建并挂接父 Spec。
 - [ ] 已检查所有前置无阻塞的 Ticket 构成清晰可领的前沿（Frontier）。
