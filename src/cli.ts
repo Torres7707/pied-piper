@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { realpathSync } from 'node:fs'
+import { existsSync, realpathSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { parseArgs } from 'node:util'
@@ -10,6 +10,7 @@ import { createJsonlEventLog, type EventLog } from './event-log.js'
 import { createGhGitHubPort, type GitHubPort } from './github.js'
 import { createDefaultInitProbe, runInit, type InitProbe } from './init.js'
 import { createNotifier, type Notifier } from './notifications.js'
+import { createStdioReplDriver, runRepl, type ReplDriver } from './repl.js'
 import { formatPublishedTaskGraphSummary, runRole } from './runner.js'
 import { formatStatusBoard } from './status.js'
 import { isGitRepo } from './worktree.js'
@@ -27,14 +28,20 @@ export interface CliDeps {
   maxPollCycles?: number
   signal?: AbortSignal
   initProbe?: InitProbe
+  repl?: ReplDriver
 }
 
 const HELP_TEXT = [
   'Usage:',
+  '  piedpiper [--repo <path>]',
   '  piedpiper init [--force] [--repo <path>]',
   '  piedpiper status [--repo <path>]',
   '  piedpiper run <role> <target> [--repo <path>] [--cwd <path>] [--timeout <ms>] [--session <id>]',
   '  piedpiper dispatch [--once | --poll] [--interval <sec>] [--hop <n>] [--repo <path>] [--timeout <ms>]',
+  '',
+  'With no subcommand, piedpiper runs init when .piedpiper/config.json is missing, then opens the piedpiper> REPL.',
+  'Slash commands: /status, /events [n], /dispatch [--once|--poll] [--interval <sec>], /run <role> <target>, /init [--force], /issue [title], /jared [#N|path], /reset, /help, /exit.',
+  'Ctrl+C during /dispatch --poll returns to the prompt. Ctrl+C, Ctrl+D, or /exit at the prompt quits.',
   '',
   'Options:',
   '  --repo <path>      Repository containing .piedpiper/config.json (default: cwd)',
@@ -74,6 +81,62 @@ function parsePositiveIntOption(raw: string | undefined, flagName: string): numb
   return parsed
 }
 
+async function startRepl(
+  repoRoot: string,
+  deps: CliDeps,
+  stdout: (text: string) => void,
+  stderr: (text: string) => void,
+  timeoutMs: number | undefined,
+): Promise<number> {
+  const configPath = path.join(repoRoot, '.piedpiper', 'config.json')
+  if (!existsSync(configPath)) {
+    const github = deps.github ?? (await resolveDefaultGitHubPort(repoRoot))
+    await runInit({
+      repoRoot,
+      force: false,
+      probe: deps.initProbe ?? createDefaultInitProbe(),
+      github,
+    })
+    stdout(`Initialized .piedpiper in ${repoRoot}\n`)
+  }
+
+  const loaded = await loadConfig(repoRoot)
+  for (const warning of loaded.warnings) {
+    stderr(`${warning}\n`)
+  }
+
+  const github = deps.github ?? (await resolveDefaultGitHubPort(repoRoot))
+  const eventLog =
+    deps.eventLog ??
+    createJsonlEventLog(resolveDefaultEventLogPath(repoRoot, loaded.config.runtime.eventLog.path))
+  const notifier =
+    deps.notifier ??
+    createNotifier({
+      config: loaded.config.runtime.notifications,
+      github,
+    })
+  const driver = deps.repl ?? createStdioReplDriver()
+  try {
+    return await runRepl({
+      repoRoot,
+      config: loaded.config,
+      stdout,
+      stderr,
+      resolveAdapter: createAdapterResolver(deps.adapterOverrides, deps.adapterDefaults),
+      github,
+      eventLog,
+      notifier,
+      worktreeBaseDir: deps.worktreeBaseDir,
+      timeoutMs,
+      maxPollCycles: deps.maxPollCycles,
+      driver,
+      initProbe: deps.initProbe,
+    })
+  } finally {
+    driver.close()
+  }
+}
+
 function parseNonNegativeIntOption(raw: string | undefined, flagName: string): number | undefined {
   if (raw === undefined) {
     return undefined
@@ -111,9 +174,16 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
       },
     })
 
-    if (parsed.values.help || parsed.positionals.length === 0) {
+    if (parsed.values.help) {
       stdout(`${HELP_TEXT}\n`)
-      return parsed.values.help ? 0 : 1
+      return 0
+    }
+
+    const repoRoot = path.resolve(parsed.values.repo ?? deps.cwd ?? process.cwd())
+    const timeoutMs = parsePositiveIntOption(parsed.values.timeout, '--timeout')
+
+    if (parsed.positionals.length === 0) {
+      return await startRepl(repoRoot, deps, stdout, stderr, timeoutMs)
     }
 
     const [subcommand, ...rest] = parsed.positionals
@@ -126,9 +196,6 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
       stderr(`Unknown subcommand "${subcommand}". Expected "run", "dispatch", "init", or "status".\n`)
       return 1
     }
-
-    const repoRoot = path.resolve(parsed.values.repo ?? deps.cwd ?? process.cwd())
-    const timeoutMs = parsePositiveIntOption(parsed.values.timeout, '--timeout')
 
     if (subcommand === 'init') {
       if (rest.length > 0) {
