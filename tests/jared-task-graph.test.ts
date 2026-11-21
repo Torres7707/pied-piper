@@ -463,4 +463,118 @@ if (args[0] === 'label' && args[1] === 'create') {
     ).rejects.toThrow(/duplicate/i)
     expect(await github.listOpenIssues()).toHaveLength(0)
   })
+
+  it('ensures the ready-for-agent label via ensureLabels before creating any issue (ADR 0003 label consistency)', async () => {
+    const repoRoot = makeTestRepo()
+    const loaded = await loadConfig(repoRoot)
+    const github = createInMemoryGitHubPort()
+    const ensureCalls: string[][] = []
+    const createCalls: string[][] = []
+    const originalEnsure = github.ensureLabels.bind(github)
+    const originalCreate = github.createIssue.bind(github)
+    github.ensureLabels = async (labels) => {
+      ensureCalls.push(labels.map((l) => l.name))
+      await originalEnsure(labels)
+    }
+    github.createIssue = async (input) => {
+      createCalls.push([input.title])
+      return originalCreate(input)
+    }
+
+    await runRole({
+      repoRoot,
+      config: loaded.config,
+      roleName: 'jared',
+      target: 'docs/adr/0003.md',
+      github,
+      resolveAdapter: createAdapterResolver({
+        jared: {
+          async run() {
+            return {
+              reply: [
+                '```json',
+                JSON.stringify({
+                  spec: { title: 'Spec: Labels', body: 'Spec body' },
+                  tickets: [{ id: 't1', title: 'Ticket 1', body: 'Body 1' }],
+                }),
+                '```',
+              ].join('\n'),
+            }
+          },
+        },
+      }),
+    })
+
+    // Label sync must precede every issue write, or `gh issue create --label`
+    // aborts on repos without pre-seeded labels.
+    expect(ensureCalls).toHaveLength(1)
+    expect(ensureCalls[0]).toContain('ready-for-agent')
+    expect(createCalls.length).toBe(2)
+    expect(ensureCalls[0]).toEqual(expect.any(Array))
+    expect(createCalls.length).toBeGreaterThan(0)
+  })
+
+  it('publishes a task graph whose spec body embeds inner fenced code samples (no silent drop)', async () => {
+    const repoRoot = makeTestRepo()
+    const loaded = await loadConfig(repoRoot)
+    const github = createInMemoryGitHubPort()
+
+    const graph = {
+      spec: {
+        title: 'Spec: Rich Body',
+        body: [
+          '## Problem Statement',
+          'Need code samples.',
+          '',
+          'Usage:',
+          '',
+          '```bash',
+          'piedpiper run jared "#10"',
+          '```',
+          '',
+          'And a TypeScript sample:',
+          '',
+          '```ts',
+          'const x = 1',
+          '```',
+        ].join('\n'),
+      },
+      tickets: [
+        {
+          id: 't1',
+          title: 'Ticket: With Snippet',
+          body: 'Body containing\n\n```json\n{"nested": true}\n```\n\nsample.',
+          blockedBy: [],
+        },
+      ],
+    }
+
+    await runRole({
+      repoRoot,
+      config: loaded.config,
+      roleName: 'jared',
+      target: 'docs/adr/0003.md',
+      github,
+      resolveAdapter: createAdapterResolver({
+        jared: {
+          async run() {
+            return {
+              reply: ['Here is the graph.', '```json', JSON.stringify(graph, null, 2), '```'].join('\n'),
+            }
+          },
+        },
+      }),
+    })
+
+    // Before the whole-span extraction fix, this valid graph was silently
+    // dropped: no publish, no error, exit 0.
+    const open = await github.listOpenIssues()
+    expect(open).toHaveLength(2)
+    const spec = open.find((i) => i.title === 'Spec: Rich Body')
+    expect(spec).toBeDefined()
+    expect(spec?.body).toContain('piedpiper run jared "#10"')
+    const ticket = open.find((i) => i.title === 'Ticket: With Snippet')
+    expect(ticket).toBeDefined()
+    expect(ticket?.body).toContain('{"nested": true}')
+  })
 })

@@ -4,7 +4,8 @@ import path from 'node:path'
 import type { AdapterResolver, AdapterUsage } from './adapters.js'
 import type { AccessMode, AdapterType, PiedPiperConfig, RoleConfig } from './config.js'
 import type { EventLog } from './event-log.js'
-import type { GitHubIssue, GitHubPort, GitHubPullRequest } from './github.js'
+import type { GitHubIssue, GitHubLabelSpec, GitHubPort, GitHubPullRequest } from './github.js'
+import { STANDARD_GITHUB_LABELS } from './github.js'
 import type { Notifier } from './notifications.js'
 import {
   hasAheadCommits,
@@ -332,6 +333,9 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
 
 function extractCandidateJsonTexts(reply: string): string[] {
   const candidates: string[] = []
+
+  // 1. Per-fence lazy matches, last first: handles the common single-fence
+  //    case and distractor fences that appear before the graph.
   const fencedMatches = [...reply.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi)]
   for (let i = fencedMatches.length - 1; i >= 0; i--) {
     const inner = fencedMatches[i]?.[1]?.trim()
@@ -339,6 +343,30 @@ function extractCandidateJsonTexts(reply: string): string[] {
       candidates.push(inner)
     }
   }
+
+  // 2. Whole-span candidates: when the graph JSON's string values embed inner
+  //    fenced code samples (```bash / ```ts), the lazy regex above splits the
+  //    block into unparseable fragments and the graph would be silently
+  //    dropped. Try the span from each fence occurrence to the final fence
+  //    close instead, stripping only the boundary fence markers: backticks are
+  //    legal characters inside JSON strings, so the graph's opening-fence span
+  //    parses with inner code fences preserved intact.
+  const fencePositions = [...reply.matchAll(/```/g)].map((m) => m.index ?? 0)
+  if (fencePositions.length >= 2) {
+    const spanEnd = fencePositions[fencePositions.length - 1]! + 3
+    for (const spanStart of fencePositions.slice(0, -1)) {
+      const stripped = reply
+        .slice(spanStart, spanEnd)
+        .replace(/^```(?:json)?\s*/, '')
+        .replace(/\s*```$/, '')
+        .trim()
+      if (stripped) {
+        candidates.push(stripped)
+      }
+    }
+  }
+
+  // 3. Bare JSON object without any fences.
   const trimmed = reply.trim()
   if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
     candidates.push(trimmed)
@@ -466,10 +494,18 @@ export function parseAndValidateJaredTaskGraph(reply: string): JaredTaskGraph | 
   }
 }
 
+const JARED_PUBLISH_LABELS: readonly GitHubLabelSpec[] = STANDARD_GITHUB_LABELS.filter(
+  (label) => label.name === 'ready-for-agent',
+)
+
 async function publishJaredTaskGraph(
   github: GitHubPort,
   graph: JaredTaskGraph,
 ): Promise<{ publishedSpecNumber: number; publishedTicketNumbers: number[] }> {
+  // ADR 0003: the host guarantees label consistency before any write, so `gh issue
+  // create --label ...` cannot abort on repos that have not pre-seeded the label.
+  await github.ensureLabels(JARED_PUBLISH_LABELS)
+
   const specIssue = await github.createIssue({
     title: graph.spec.title,
     body: graph.spec.body,
