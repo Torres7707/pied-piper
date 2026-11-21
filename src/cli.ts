@@ -8,8 +8,10 @@ import { loadConfig } from './config.js'
 import { dispatchOnce, dispatchPoll, resolveDefaultEventLogPath } from './dispatcher.js'
 import { createJsonlEventLog, type EventLog } from './event-log.js'
 import { createGhGitHubPort, type GitHubPort } from './github.js'
+import { createDefaultInitProbe, runInit, type InitProbe } from './init.js'
 import { createNotifier, type Notifier } from './notifications.js'
 import { formatPublishedTaskGraphSummary, runRole } from './runner.js'
+import { formatStatusBoard } from './status.js'
 import { isGitRepo } from './worktree.js'
 
 export interface CliDeps {
@@ -24,15 +26,19 @@ export interface CliDeps {
   notifier?: Notifier
   maxPollCycles?: number
   signal?: AbortSignal
+  initProbe?: InitProbe
 }
 
 const HELP_TEXT = [
   'Usage:',
+  '  piedpiper init [--force] [--repo <path>]',
+  '  piedpiper status [--repo <path>]',
   '  piedpiper run <role> <target> [--repo <path>] [--cwd <path>] [--timeout <ms>] [--session <id>]',
   '  piedpiper dispatch [--once | --poll] [--interval <sec>] [--hop <n>] [--repo <path>] [--timeout <ms>]',
   '',
   'Options:',
   '  --repo <path>      Repository containing .piedpiper/config.json (default: cwd)',
+  '  --force            Re-detect the environment and overwrite init config and role files',
   '  --cwd <path>       Working directory passed to the adapter (default: repo)',
   '  --timeout <ms>     Adapter execution timeout in milliseconds',
   '  --session <id>     Optional session ID to resume',
@@ -100,6 +106,7 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
         poll: { type: 'boolean' },
         interval: { type: 'string' },
         hop: { type: 'string' },
+        force: { type: 'boolean' },
         help: { type: 'boolean', short: 'h' },
       },
     })
@@ -110,13 +117,52 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
     }
 
     const [subcommand, ...rest] = parsed.positionals
-    if (subcommand !== 'run' && subcommand !== 'dispatch') {
-      stderr(`Unknown subcommand "${subcommand}". Expected "run" or "dispatch".\n`)
+    if (
+      subcommand !== 'run' &&
+      subcommand !== 'dispatch' &&
+      subcommand !== 'init' &&
+      subcommand !== 'status'
+    ) {
+      stderr(`Unknown subcommand "${subcommand}". Expected "run", "dispatch", "init", or "status".\n`)
       return 1
     }
 
     const repoRoot = path.resolve(parsed.values.repo ?? deps.cwd ?? process.cwd())
     const timeoutMs = parsePositiveIntOption(parsed.values.timeout, '--timeout')
+
+    if (subcommand === 'init') {
+      if (rest.length > 0) {
+        stderr('Usage: piedpiper init [--force] [--repo <path>]\n')
+        return 1
+      }
+      const github = deps.github ?? (await resolveDefaultGitHubPort(repoRoot))
+      await runInit({
+        repoRoot,
+        force: parsed.values.force === true,
+        probe: deps.initProbe ?? createDefaultInitProbe(),
+        github,
+      })
+      stdout(`Initialized .piedpiper in ${repoRoot}\n`)
+      return 0
+    }
+
+    if (subcommand === 'status') {
+      if (rest.length > 0) {
+        stderr('Usage: piedpiper status [--repo <path>]\n')
+        return 1
+      }
+      const github = deps.github ?? (await resolveDefaultGitHubPort(repoRoot))
+      if (!github) {
+        throw new Error('GitHub port is unavailable: repository has no GitHub remote configured')
+      }
+      const [issues, pullRequests] = await Promise.all([
+        github.listOpenIssues(),
+        github.listOpenPullRequests(),
+      ])
+      stdout(formatStatusBoard(issues, pullRequests))
+      return 0
+    }
+
     const loaded = await loadConfig(repoRoot)
     for (const warning of loaded.warnings) {
       stderr(`${warning}\n`)
