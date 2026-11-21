@@ -9,7 +9,7 @@
 | **Dinesh** | 在独立 `git worktree` 中按 TDD 实现单个前沿任务并开 PR | `write` | `tdd`、`diagnosing-bugs`、`codebase-design` |
 | **Gilfoyle** | 盲审隔离、严格只读地对抗式评审 PR，必须给出具体发现或明确通过理由 | `read` | `code-review`、`pr` |
 
-> **当前状态**：L0 角色规范、L1 单角色运行器（`piedpiper run`）与 L2 无状态调度器（`piedpiper dispatch`）均已在 `main` 就绪。完整设计见 [docs/DESIGN.md](docs/DESIGN.md)，术语表见 [GLOSSARY.md](GLOSSARY.md)，仓库规则见 [CLAUDE.md](CLAUDE.md)。
+> **当前状态**：L0 角色规范、L1 单角色运行器（`piedpiper run`）与 L2 无状态调度器（`piedpiper dispatch`）均已在 `main` 就绪。无参数的 `piedpiper` 会在缺少 `.piedpiper/config.json` 时自动执行 `piedpiper init`，然后进入 `piedpiper>` REPL。完整设计见 [docs/DESIGN.md](docs/DESIGN.md)，术语表见 [GLOSSARY.md](GLOSSARY.md)，仓库规则见 [CLAUDE.md](CLAUDE.md)。
 
 ---
 
@@ -65,11 +65,21 @@ piedpiper --help
 
 ## 二、初始化目标仓库
 
-要让 Pied Piper 管理你自己的 GitHub 仓库，需要准备**本地配置文件**与**GitHub 标签**。
+在目标仓库根目录运行 `piedpiper init`。命令会先检查：当前目录是 git 仓库、`origin` 指向 GitHub、`gh` 已登录、并且本机至少有 `claude` 或 `codex` 之一。任一检查失败时，只打印下一步该执行的命令，并且不会创建 `.piedpiper/`。
 
-### 1. 准备 `.piedpiper/` 配置目录
+检查通过后，`piedpiper init` 会：
 
-将本仓库的 `.piedpiper/` 模板复制到你的目标仓库根目录：
+- 在文件缺失时写入 `.piedpiper/config.json` 和四个角色说明。已有文件默认保留；`piedpiper init --force` 会重新探测本机环境并覆盖配置与角色说明。
+- 幂等写入 `.gitignore` 里的 `.piedpiper/events.jsonl` 和 `.piedpiper/tmp/`。
+- 在 GitHub 仓库上创建下面七个标准状态标签（已存在则更新颜色与说明）。
+
+没有 `.piedpiper/config.json` 时，无参数的 `piedpiper` 会先做一次非强制初始化，然后进入 `piedpiper>` REPL。仓库已经初始化时，无参数命令直接进入 REPL。
+
+用 `piedpiper status` 查看四组看板：Frontier、In Progress、In Review、Needs Human。
+
+### 1. `piedpiper init` 写出的目录
+
+`piedpiper init` 在目标仓库根目录生成：
 
 ```text
 <your-repo>/
@@ -82,7 +92,7 @@ piedpiper --help
         └── gilfoyle.md      # Gilfoyle 角色说明
 ```
 
-默认 [`.piedpiper/config.json`](.piedpiper/config.json) 关键字段如下：
+生成后的 [`.piedpiper/config.json`](.piedpiper/config.json) 关键字段如下：
 
 #### `roles.<name>`（角色配置）
 
@@ -112,47 +122,65 @@ piedpiper --help
 | `eventLog.type` | `"jsonl"` | 事件日志格式（当前支持 `"jsonl"`） |
 | `eventLog.path` | `".piedpiper/events.jsonl"` | 只追加事件日志路径（须位于仓库根目录内） |
 
-### 2. 配置 `.gitignore`
+### 2. `.gitignore`
 
-运行时会产生本地日志与只读临时资料文件，建议在目标仓库 `.gitignore` 中加入：
+`piedpiper init` 会幂等加入下面两行，不必手写。重复执行不会再插一份：
 
 ```gitignore
 .piedpiper/events.jsonl
 .piedpiper/tmp/
 ```
 
-### 3. 创建 GitHub 状态标签
+### 3. GitHub 状态标签
 
-`piedpiper` 使用 GitHub 标签流转任务状态。请在目标仓库中先创建好以下标签（已存在时 `--force` 可幂等更新）：
+`piedpiper init` 会创建下面七个标签，不必再跑 `gh label create`。调度器只用这些名字流转任务状态：
 
-```bash
-gh label create ready-for-agent --color 0e8a16 --description "Fully specified, ready for an AFK agent" --force
-gh label create in-progress    --color fbca04 --description "Claimed by a Dinesh run" --force
-gh label create in-review      --color 5319e7 --description "PR opened and handed over to Gilfoyle for review" --force
-gh label create ready-for-human --color d93f0b --description "Requires human decision or implementation" --force
-gh label create needs-triage    --color c2e0c6 --description "Maintainer needs to evaluate this issue" --force
-gh label create needs-info      --color d4c5f9 --description "Waiting on reporter for more information" --force
-gh label create wontfix         --color ffffff --description "Will not be actioned" --force
-```
+| 标签 | 颜色 | 含义 |
+|---|---|---|
+| `ready-for-agent` | `0e8a16` | 规格完整，可以被无人值守的 agent 领取 |
+| `in-progress` | `fbca04` | 已被一次 Dinesh 运行领取 |
+| `in-review` | `5319e7` | PR 已开出，交给 Gilfoyle 评审 |
+| `ready-for-human` | `d93f0b` | 需要人做决定或接手实现 |
+| `needs-triage` | `ededed` | 维护者还没评估这条 issue |
+| `needs-info` | `d876e3` | 在等报告人补充信息 |
+| `wontfix` | `ffffff` | 不会处理 |
 
 ---
 
 ## 三、完整使用教程（从想法到 PR 合并）
 
-下面以“在一个已配置 `.piedpiper/` 的仓库中开发新功能”为例，串起完整开发闭环。
+下面以“在目标仓库里开发新功能”为例，串起完整开发闭环。仓库还没有 `.piedpiper/config.json` 时，第 1 步的无参数命令会先自动初始化。
 
 ### 第 1 步：与 Richard 讨论想法（Idea → 已拍板方向）
 
 Richard 负责帮你澄清需求、比较至少 **3 个实质不同的方向与代价**，**不会写代码也不会改动任务板**。
 
-- **方式 A（推荐，交互式会话）**：在你的 Claude Code / 终端交互会话中指示它：
-  > 读取 `.piedpiper/roles/richard.md`、`GLOSSARY.md` 和 `docs/adr/`，我想实现 `<你的想法>`，请按 Richard 的规则与我讨论。
-- **方式 B（通过 CLI 单次调用）**：如果你已经有一个初步想法 issue（例如 `#10`）或文档路径，也可以直接运行：
-  ```bash
-  piedpiper run richard "#10" --repo /path/to/your-repo
-  ```
+推荐在目标仓库里直接打开 REPL：
 
-你拍板选定方向后，让 Richard 把结论落盘为 **GitHub issue**（例如 `#10`）或 **`docs/adr/NNNN-*.md` 文档**——后续角色只通过指针消费结果。
+```bash
+cd /path/to/your-repo
+piedpiper
+```
+
+`piedpiper>` 提示符下的普通文本会发给 Richard。第一句会带上 `roles/richard.md`、`GLOSSARY.md` 和 `docs/adr/`；之后每一句只发送你刚输入的文本，并沿用上一轮返回的会话。拍板之后：
+
+- `/issue [title]`：把当前 Richard 会话蒸馏成一条 GitHub issue。方括号里的标题可选，给出时覆盖 Richard 返回的标题。
+- `/jared`：先创建结论 issue，再让 Jared 发布父 Spec 和带阻塞关系的 Ticket。
+- `/jared #10` 或 `/jared docs/adr/0004-thing.md`：对已经落盘的指针直接跑 Jared，不要求先有 Richard 会话。
+- `/reset`：忘掉当前 Richard 会话，下一句重新作为第一轮。
+
+REPL 里还可以用 `/status`、`/events [n]`、`/dispatch [--once|--poll]`、`/run <role> <target>`、`/init [--force]`、`/help` 和 `/exit`。
+
+`/dispatch --poll` 期间按一次 Ctrl+C，只停止轮询并回到 `piedpiper>`，Richard 会话保留。在空闲提示符按 Ctrl+C、Ctrl+D，或输入 `/exit`，则退出 REPL。
+
+已经有 issue 或文档指针、又不想进 REPL 时，用单次命令：
+
+```bash
+piedpiper run richard "#10" --repo /path/to/your-repo
+piedpiper run jared "#10" --repo /path/to/your-repo
+```
+
+结论必须落成 **GitHub issue**（例如 `#10`）或 **`docs/adr/NNNN-*.md`**。后续角色只通过这些指针消费结果。
 
 ---
 
