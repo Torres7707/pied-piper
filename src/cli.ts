@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url'
 import { parseArgs } from 'node:util'
 import { createAdapterResolver, execSubprocess, type Adapter, type AdapterResolverOptions } from './adapters.js'
 import { loadConfig } from './config.js'
+import { dispatchOnce, dispatchPoll, resolveDefaultEventLogPath } from './dispatcher.js'
 import { createJsonlEventLog, type EventLog } from './event-log.js'
 import { createGhGitHubPort, type GitHubPort } from './github.js'
 import { createNotifier, type Notifier } from './notifications.js'
@@ -21,17 +22,24 @@ export interface CliDeps {
   worktreeBaseDir?: string
   eventLog?: EventLog
   notifier?: Notifier
+  maxPollCycles?: number
+  signal?: AbortSignal
 }
 
 const HELP_TEXT = [
   'Usage:',
   '  piedpiper run <role> <target> [--repo <path>] [--cwd <path>] [--timeout <ms>] [--session <id>]',
+  '  piedpiper dispatch [--once | --poll] [--interval <sec>] [--hop <n>] [--repo <path>] [--timeout <ms>]',
   '',
   'Options:',
   '  --repo <path>      Repository containing .piedpiper/config.json (default: cwd)',
   '  --cwd <path>       Working directory passed to the adapter (default: repo)',
   '  --timeout <ms>     Adapter execution timeout in milliseconds',
   '  --session <id>     Optional session ID to resume',
+  '  --once             Run a single dispatch cycle (default for dispatch)',
+  '  --poll             Run dispatcher continuously at pollIntervalSec',
+  '  --interval <sec>   Override poll interval in seconds',
+  '  --hop <n>          Initial event chain hop count for dispatch',
   '  -h, --help         Show this help message',
 ].join('\n')
 
@@ -49,13 +57,24 @@ async function resolveDefaultGitHubPort(repoRoot: string): Promise<GitHubPort | 
   return createGhGitHubPort({ cwd: repoRoot })
 }
 
-function parseTimeoutOption(raw: string | undefined): number | undefined {
+function parsePositiveIntOption(raw: string | undefined, flagName: string): number | undefined {
   if (raw === undefined) {
     return undefined
   }
   const parsed = Number(raw)
   if (!Number.isInteger(parsed) || parsed <= 0) {
-    throw new Error(`Invalid --timeout value "${raw}": expected a positive integer (ms)`)
+    throw new Error(`Invalid ${flagName} value "${raw}": expected a positive integer`)
+  }
+  return parsed
+}
+
+function parseNonNegativeIntOption(raw: string | undefined, flagName: string): number | undefined {
+  if (raw === undefined) {
+    return undefined
+  }
+  const parsed = Number(raw)
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    throw new Error(`Invalid ${flagName} value "${raw}": expected a non-negative integer`)
   }
   return parsed
 }
@@ -77,6 +96,10 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
         cwd: { type: 'string' },
         timeout: { type: 'string' },
         session: { type: 'string' },
+        once: { type: 'boolean' },
+        poll: { type: 'boolean' },
+        interval: { type: 'string' },
+        hop: { type: 'string' },
         help: { type: 'boolean', short: 'h' },
       },
     })
@@ -86,20 +109,14 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
       return parsed.values.help ? 0 : 1
     }
 
-    const [subcommand, roleName, target, ...extra] = parsed.positionals
-    if (subcommand !== 'run') {
-      stderr(`Unknown subcommand "${subcommand}". Expected "run".\n`)
-      return 1
-    }
-
-    if (!roleName || !target || extra.length > 0) {
-      stderr('Usage: piedpiper run <role> <target> [options]\n')
+    const [subcommand, ...rest] = parsed.positionals
+    if (subcommand !== 'run' && subcommand !== 'dispatch') {
+      stderr(`Unknown subcommand "${subcommand}". Expected "run" or "dispatch".\n`)
       return 1
     }
 
     const repoRoot = path.resolve(parsed.values.repo ?? deps.cwd ?? process.cwd())
-    const timeoutMs = parseTimeoutOption(parsed.values.timeout)
-
+    const timeoutMs = parsePositiveIntOption(parsed.values.timeout, '--timeout')
     const loaded = await loadConfig(repoRoot)
     for (const warning of loaded.warnings) {
       stderr(`${warning}\n`)
@@ -108,20 +125,77 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
     const github = deps.github ?? (await resolveDefaultGitHubPort(repoRoot))
     const eventLog =
       deps.eventLog ??
-      createJsonlEventLog(path.resolve(repoRoot, loaded.config.runtime.eventLog.path))
+      createJsonlEventLog(
+        resolveDefaultEventLogPath(repoRoot, loaded.config.runtime.eventLog.path),
+      )
     const notifier =
       deps.notifier ??
       createNotifier({
         config: loaded.config.runtime.notifications,
         github,
       })
+    const resolveAdapter = createAdapterResolver(deps.adapterOverrides, deps.adapterDefaults)
+
+    if (subcommand === 'dispatch') {
+      if (rest.length > 0) {
+        stderr('Usage: piedpiper dispatch [--once | --poll] [options]\n')
+        return 1
+      }
+      if (!github) {
+        throw new Error('GitHub port is unavailable: repository has no GitHub remote configured')
+      }
+      const hop = parseNonNegativeIntOption(parsed.values.hop, '--hop')
+      const intervalSec = parsePositiveIntOption(parsed.values.interval, '--interval')
+      const dispatchInput = {
+        repoRoot,
+        config: loaded.config,
+        github,
+        resolveAdapter,
+        worktreeBaseDir: deps.worktreeBaseDir,
+        timeoutMs,
+        eventLog,
+        notifier,
+        hop,
+      }
+
+      if (parsed.values.poll) {
+        const cycles = await dispatchPoll({
+          ...dispatchInput,
+          intervalMs:
+            intervalSec !== undefined
+              ? intervalSec * 1000
+              : loaded.config.runtime.dispatcher.pollIntervalSec * 1000,
+          maxCycles: deps.maxPollCycles,
+          signal: deps.signal,
+          onCycle: (res, cycle) => {
+            stdout(
+              `Cycle ${cycle}: frontier=[${res.frontierIssues.join(',')}] dinesh=[${res.dispatchedDinesh.join(',')}] gilfoyle=[${res.dispatchedGilfoyle.join(',')}] halted=${res.halted}\n`,
+            )
+          },
+        })
+        const last = cycles.at(-1)
+        return last && last.errors.length > 0 ? 1 : 0
+      }
+
+      const res = await dispatchOnce(dispatchInput)
+      stdout(
+        `Dispatch: frontier=[${res.frontierIssues.map((n) => `#${n}`).join(',')}] dinesh=[${res.dispatchedDinesh.map((n) => `#${n}`).join(',')}] gilfoyle=[${res.dispatchedGilfoyle.map((n) => `PR #${n}`).join(',')}] halted=${res.halted}\n`,
+      )
+      return res.errors.length > 0 ? 1 : 0
+    }
+
+    const [roleName, target, ...extra] = rest
+    if (!roleName || !target || extra.length > 0) {
+      stderr('Usage: piedpiper run <role> <target> [options]\n')
+      return 1
+    }
 
     const result = await runRole({
       repoRoot,
       config: loaded.config,
       roleName,
       target,
-      resolveAdapter: createAdapterResolver(deps.adapterOverrides, deps.adapterDefaults),
+      resolveAdapter,
       cwd: parsed.values.cwd ? path.resolve(parsed.values.cwd) : undefined,
       timeoutMs,
       sessionId: parsed.values.session,
