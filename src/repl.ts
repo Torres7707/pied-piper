@@ -113,17 +113,18 @@ export function createStdioReplDriver(
     output,
     terminal: Boolean((input as NodeJS.ReadStream).isTTY),
   })
-  rl.on('SIGINT', () => {
-    // A listener here keeps readline from treating Ctrl+C as EOF.
-  })
 
   const listeners = new Set<() => void>()
-  const onProcessSigint = (): void => {
+  let closed = false
+  const emitSigint = (): void => {
+    if (closed) return
     for (const listener of [...listeners]) listener()
   }
-  process.on('SIGINT', onProcessSigint)
+  // A TTY puts stdin in raw mode, so Ctrl+C is a readline SIGINT and not a process signal.
+  // Keeping a listener also stops readline from closing the interface on Ctrl+C.
+  rl.on('SIGINT', emitSigint)
+  process.on('SIGINT', emitSigint)
 
-  let closed = false
   return {
     readLine(prompt: string): Promise<string | null> {
       if (closed) return Promise.resolve(null)
@@ -149,7 +150,7 @@ export function createStdioReplDriver(
     close(): void {
       if (closed) return
       closed = true
-      process.off('SIGINT', onProcessSigint)
+      process.off('SIGINT', emitSigint)
       rl.close()
     },
   }
@@ -283,14 +284,29 @@ export async function runRepl(input: RunReplInput): Promise<number> {
       model: role.model,
       status: 'started',
     })
-    const response = await resolveAdapter('richard', role).run({
-      prompt,
-      cwd: repoRoot,
-      model: role.model,
-      sessionId: richardSessionId,
-      access: role.access,
-      timeoutMs,
-    })
+    let response
+    try {
+      response = await resolveAdapter('richard', role).run({
+        prompt,
+        cwd: repoRoot,
+        model: role.model,
+        sessionId: richardSessionId,
+        access: role.access,
+        timeoutMs,
+      })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      await appendEvent({
+        type: 'run.failed',
+        role: 'richard',
+        target: 'repl',
+        adapter: role.adapter,
+        model: role.model,
+        status: 'failed',
+        error: message,
+      }).catch(() => {})
+      throw error
+    }
     if (response.sessionId && response.sessionId.length > 0) {
       richardSessionId = response.sessionId
     }

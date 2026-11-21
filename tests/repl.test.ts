@@ -1,6 +1,7 @@
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
+import { PassThrough } from 'node:stream'
 import { fileURLToPath } from 'node:url'
 import { afterEach, describe, expect, it } from 'vitest'
 import type { Adapter, AdapterRequest, AdapterResponse } from '../src/adapters.js'
@@ -9,7 +10,7 @@ import { loadConfig } from '../src/config.js'
 import { createJsonlEventLog, type EventLogEntry } from '../src/event-log.js'
 import { createInMemoryGitHubPort, type InMemoryGitHubPort } from '../src/github.js'
 import type { InitProbe } from '../src/init.js'
-import type { ReplDriver } from '../src/repl.js'
+import { createStdioReplDriver, type ReplDriver } from '../src/repl.js'
 
 const tempDirs: string[] = []
 const packageRoot = fileURLToPath(new URL('..', import.meta.url))
@@ -138,6 +139,27 @@ function scriptedDriver(
 }
 
 const silentNotifier = { async notify(): Promise<void> {} }
+
+function fakeTtyInput(): PassThrough {
+  const input = new PassThrough()
+  Object.assign(input, {
+    isTTY: true,
+    setRawMode() {
+      return input
+    },
+  })
+  return input
+}
+
+async function waitUntil(predicate: () => boolean, label: string): Promise<void> {
+  const started = Date.now()
+  while (!predicate()) {
+    if (Date.now() - started > 2000) {
+      throw new Error(`timed out waiting for ${label}`)
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+}
 
 async function runSession(options: {
   ready?: boolean
@@ -611,6 +633,133 @@ describe('piedpiper REPL', () => {
 
     const quit = await runSession({ lines: ['/quit'] })
     expect(quit.code).toBe(0)
+  })
+
+  it('records run.failed when distillation throws, and does not create an issue', async () => {
+    const session = await runSession({
+      lines: ['discuss', '/issue', '/exit'],
+      recordEvents: true,
+      adapters: {
+        richard: {
+          async run(req) {
+            if (req.sessionId === undefined) {
+              return { reply: 'directions', sessionId: 'sess-distill' }
+            }
+            throw new Error('distill exploded')
+          },
+        },
+      },
+    })
+
+    expect(session.code).toBe(0)
+    expect(session.stderr).toMatch(/distill exploded/)
+    expect(await session.github.listOpenIssues()).toEqual([])
+    expect(session.events.map((event) => event.type)).toEqual([
+      'run.started',
+      'run.completed',
+      'run.started',
+      'run.failed',
+    ])
+    expect(session.events[3]).toMatchObject({
+      role: 'richard',
+      target: 'repl',
+      status: 'failed',
+      error: 'distill exploded',
+    })
+  })
+
+  it('exits 0 when the TTY driver receives Ctrl+C at the idle prompt', async () => {
+    const repoRoot = makeTempDir()
+    writeReadyRepo(repoRoot)
+    const input = fakeTtyInput()
+    const output = new PassThrough()
+    let seen = ''
+    output.on('data', (chunk: Buffer) => {
+      seen += chunk.toString()
+    })
+    const driver = createStdioReplDriver(input, output)
+    const pending = runCli(['--repo', repoRoot], {
+      stdout: () => {},
+      stderr: () => {},
+      github: createInMemoryGitHubPort(),
+      repl: driver,
+      notifier: silentNotifier,
+    })
+    let finished = false
+    try {
+      await waitUntil(() => seen.includes('piedpiper>'), 'idle prompt')
+      input.write('\x03')
+      await expect(pending).resolves.toBe(0)
+      finished = true
+    } finally {
+      if (!finished) {
+        process.emit('SIGINT')
+        driver.close()
+        await Promise.race([pending, new Promise((resolve) => setTimeout(resolve, 500))])
+      }
+    }
+  })
+
+  it('stops /dispatch --poll when the TTY driver receives Ctrl+C and keeps the Richard session', async () => {
+    const repoRoot = makeTempDir()
+    writeReadyRepo(repoRoot)
+    const input = fakeTtyInput()
+    const output = new PassThrough()
+    let seen = ''
+    output.on('data', (chunk: Buffer) => {
+      seen += chunk.toString()
+    })
+    const requests: AdapterRequest[] = []
+    let stdout = ''
+    const driver = createStdioReplDriver(input, output)
+    const pending = runCli(['--repo', repoRoot], {
+      stdout: (chunk) => {
+        stdout += chunk
+      },
+      stderr: () => {},
+      github: createInMemoryGitHubPort(),
+      repl: driver,
+      notifier: silentNotifier,
+      adapterOverrides: {
+        richard: {
+          async run(req) {
+            requests.push(req)
+            if (req.sessionId !== undefined) {
+              return { reply: 'continued', sessionId: req.sessionId }
+            }
+            return { reply: 'opened', sessionId: 'sess-tty' }
+          },
+        },
+      },
+    })
+    const prompts = (): number => seen.split('piedpiper>').length - 1
+    let finished = false
+    try {
+      await waitUntil(() => prompts() >= 1, 'first prompt')
+      input.write('first idea\n')
+      await waitUntil(() => stdout.includes('opened') && prompts() >= 2, 'second prompt')
+      input.write('/dispatch --poll --interval 60\n')
+      await waitUntil(() => stdout.includes('Cycle 1:'), 'poll cycle')
+      input.write('\x03')
+      await waitUntil(() => stdout.includes('Dispatch poll stopped.') && prompts() >= 3, 'prompt after poll')
+      input.write('second idea\n')
+      await waitUntil(() => requests.length >= 2 && prompts() >= 4, 'second Richard turn')
+      input.write('\x03')
+      await expect(pending).resolves.toBe(0)
+      finished = true
+    } finally {
+      if (!finished) {
+        process.emit('SIGINT')
+        await new Promise((resolve) => setTimeout(resolve, 20))
+        process.emit('SIGINT')
+        driver.close()
+        await Promise.race([pending, new Promise((resolve) => setTimeout(resolve, 500))])
+      }
+    }
+
+    expect(requests).toHaveLength(2)
+    expect(requests[1]!.prompt).toBe('second idea')
+    expect(requests[1]!.sessionId).toBe('sess-tty')
   })
 
   it('documents the no-arg REPL in --help and README', async () => {
