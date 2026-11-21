@@ -46,7 +46,7 @@ export interface DispatchPollInput extends DispatchOnceInput {
 
 function isFrontierIssue(
   issue: GitHubIssue,
-  openPrs: GitHubPullRequest[],
+  openPrs: readonly GitHubPullRequest[],
   parentIdsWithOpenChildren: Set<number>,
 ): boolean {
   if (!issue.labels.includes('ready-for-agent')) return false
@@ -59,7 +59,7 @@ function isFrontierIssue(
   return true
 }
 
-function getParentIdsWithOpenChildren(openIssues: GitHubIssue[]): Set<number> {
+function getParentIdsWithOpenChildren(openIssues: readonly GitHubIssue[]): Set<number> {
   const parents = new Set<number>()
   for (const issue of openIssues) {
     if (issue.parentNumber !== undefined) {
@@ -67,6 +67,15 @@ function getParentIdsWithOpenChildren(openIssues: GitHubIssue[]): Set<number> {
     }
   }
   return parents
+}
+
+/** Open tickets the dispatcher may claim: ready, unblocked, and not a parent spec with open children. */
+export function listFrontierIssues(
+  openIssues: readonly GitHubIssue[],
+  openPrs: readonly GitHubPullRequest[],
+): GitHubIssue[] {
+  const parentIdsWithOpenChildren = getParentIdsWithOpenChildren(openIssues)
+  return openIssues.filter((issue) => isFrontierIssue(issue, openPrs, parentIdsWithOpenChildren))
 }
 
 async function setIssueLabelState(params: {
@@ -669,11 +678,7 @@ export async function dispatchOnce(input: DispatchOnceInput): Promise<DispatchOn
   const openIssues = await github.listOpenIssues()
   const openPrs = await github.listOpenPullRequests()
   const issueByNumber = new Map(openIssues.map((issue) => [issue.number, issue]))
-  const parentIdsWithOpenChildren = getParentIdsWithOpenChildren(openIssues)
-
-  const frontier = openIssues.filter((issue) =>
-    isFrontierIssue(issue, openPrs, parentIdsWithOpenChildren),
-  )
+  const frontier = listFrontierIssues(openIssues, openPrs)
 
   let currentHop = input.hop ?? (await inferChainHopFromLog(eventLog))
   if (currentHop >= maxHops) {
