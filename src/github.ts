@@ -34,6 +34,58 @@ export interface GitHubReview {
   submittedAt?: string
 }
 
+export interface CreateIssueInput {
+  title: string
+  body: string
+  labels?: string[]
+  parentNumber?: number
+  blockedByNumbers?: number[]
+}
+
+export interface GitHubLabelSpec {
+  name: string
+  color: string
+  description: string
+}
+
+export const STANDARD_GITHUB_LABELS: readonly GitHubLabelSpec[] = [
+  {
+    name: 'ready-for-agent',
+    color: '0e8a16',
+    description: 'Fully specified, ready for an AFK agent',
+  },
+  {
+    name: 'in-progress',
+    color: 'fbca04',
+    description: 'Claimed by a Dinesh instance',
+  },
+  {
+    name: 'in-review',
+    color: '5319e7',
+    description: 'PR opened and handed over to Gilfoyle for review',
+  },
+  {
+    name: 'ready-for-human',
+    color: 'd93f0b',
+    description: 'Requires developer decision or implementation',
+  },
+  {
+    name: 'needs-triage',
+    color: 'ededed',
+    description: 'Maintainer needs to evaluate this issue',
+  },
+  {
+    name: 'needs-info',
+    color: 'd876e3',
+    description: 'Waiting on reporter for more information',
+  },
+  {
+    name: 'wontfix',
+    color: 'ffffff',
+    description: 'Will not be actioned',
+  },
+]
+
 export interface CreatePullRequestInput {
   title: string
   body: string
@@ -50,6 +102,8 @@ export interface SubmitReviewInput {
 export interface GitHubPort {
   listOpenIssues(): Promise<GitHubIssue[]>
   getIssue(issueNumber: number): Promise<GitHubIssue>
+  createIssue(input: CreateIssueInput): Promise<GitHubIssue>
+  ensureLabels(labels: readonly GitHubLabelSpec[]): Promise<void>
   addLabels(issueNumber: number, labels: string[]): Promise<void>
   removeLabels(issueNumber: number, labels: string[]): Promise<void>
   listOpenPullRequests(): Promise<GitHubPullRequest[]>
@@ -295,6 +349,43 @@ export function createGhGitHubPort(options: GhGitHubPortOptions): GitHubPort {
       return mapGraphqlIssue(node)
     },
 
+    async createIssue(input: CreateIssueInput): Promise<GitHubIssue> {
+      const args = ['issue', 'create', '--title', input.title, '--body', input.body]
+      for (const label of input.labels ?? []) {
+        args.push('--label', label)
+      }
+      if (input.parentNumber !== undefined) {
+        args.push('--parent', String(input.parentNumber))
+      }
+      if (input.blockedByNumbers && input.blockedByNumbers.length > 0) {
+        args.push('--blocked-by', input.blockedByNumbers.join(','))
+      }
+      const out = await runGh(args)
+      const issueUrl = out.trim().split(/\r?\n/).at(-1) ?? ''
+      const match = issueUrl.match(/\/issues\/(\d+)/)
+      if (match?.[1]) {
+        return this.getIssue(Number(match[1]))
+      }
+      throw new GitHubError(
+        `Created issue "${input.title}" but could not resolve issue number from output: ${out.trim()}`,
+      )
+    },
+
+    async ensureLabels(labels: readonly GitHubLabelSpec[]): Promise<void> {
+      for (const label of labels) {
+        await runGh([
+          'label',
+          'create',
+          label.name,
+          '--color',
+          label.color,
+          '--description',
+          label.description,
+          '--force',
+        ])
+      }
+    },
+
     async addLabels(issueNumber: number, labels: string[]): Promise<void> {
       if (labels.length === 0) return
       const args = ['issue', 'edit', String(issueNumber)]
@@ -413,6 +504,7 @@ export interface InMemoryGitHubPort extends GitHubPort {
   setPullRequestDiff(prNumber: number, diff: string): void
   closeIssue(issueNumber: number): void
   getIssueComments(targetNumber: number): string[]
+  getEnsuredLabels(): GitHubLabelSpec[]
 }
 
 /**
@@ -424,7 +516,9 @@ export function createInMemoryGitHubPort(seed: InMemoryGitHubSeed = {}): InMemor
   const diffs = new Map<number, string>()
   const reviews = new Map<number, GitHubReview[]>()
   const comments = new Map<number, string[]>()
+  const ensuredLabels = new Map<string, GitHubLabelSpec>()
 
+  let nextIssueNumber = 1
   let nextPrNumber = 1
   for (const issue of seed.issues ?? []) {
     issues.set(issue.number, {
@@ -432,6 +526,7 @@ export function createInMemoryGitHubPort(seed: InMemoryGitHubSeed = {}): InMemor
       labels: [...issue.labels],
       blockedBy: issue.blockedBy.map((b) => ({ ...b })),
     })
+    nextIssueNumber = Math.max(nextIssueNumber, issue.number + 1)
   }
   for (const pr of seed.pullRequests ?? []) {
     const { diff, reviews: prReviews, ...prData } = pr
@@ -469,6 +564,42 @@ export function createInMemoryGitHubPort(seed: InMemoryGitHubSeed = {}): InMemor
       const issue = issues.get(issueNumber)
       if (!issue) throw new GitHubError(`Issue #${issueNumber} not found`)
       return refreshBlockedBy(issue)
+    },
+
+    async createIssue(input: CreateIssueInput): Promise<GitHubIssue> {
+      if (input.parentNumber !== undefined && !issues.has(input.parentNumber)) {
+        throw new GitHubError(`Parent issue #${input.parentNumber} not found`)
+      }
+      const blockedBy: GitHubIssueRef[] = []
+      for (const depNumber of input.blockedByNumbers ?? []) {
+        const dep = issues.get(depNumber)
+        if (!dep) {
+          throw new GitHubError(`Blocking issue #${depNumber} not found`)
+        }
+        blockedBy.push({
+          number: dep.number,
+          state: dep.state,
+          title: dep.title,
+        })
+      }
+      const number = nextIssueNumber++
+      const created: GitHubIssue = {
+        number,
+        title: input.title,
+        body: input.body,
+        state: 'OPEN',
+        labels: [...new Set(input.labels ?? [])],
+        blockedBy,
+        ...(input.parentNumber !== undefined ? { parentNumber: input.parentNumber } : {}),
+      }
+      issues.set(number, created)
+      return refreshBlockedBy(created)
+    },
+
+    async ensureLabels(labels: readonly GitHubLabelSpec[]): Promise<void> {
+      for (const label of labels) {
+        ensuredLabels.set(label.name, { ...label })
+      }
     },
 
     async addLabels(issueNumber: number, labels: string[]): Promise<void> {
@@ -560,6 +691,10 @@ export function createInMemoryGitHubPort(seed: InMemoryGitHubSeed = {}): InMemor
 
     getIssueComments(targetNumber: number): string[] {
       return [...(comments.get(targetNumber) ?? [])]
+    },
+
+    getEnsuredLabels(): GitHubLabelSpec[] {
+      return [...ensuredLabels.values()].map((l) => ({ ...l }))
     },
   }
 }
