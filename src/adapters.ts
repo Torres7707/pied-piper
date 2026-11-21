@@ -1,11 +1,12 @@
 import { spawn } from 'node:child_process'
-import type { RoleConfig } from './config.js'
+import type { AccessMode, RoleConfig } from './config.js'
 
 export interface AdapterRequest {
   prompt: string
   cwd: string
   model?: string
   sessionId?: string
+  access?: AccessMode
   timeoutMs: number
 }
 
@@ -112,9 +113,13 @@ export function execSubprocess(
       stderr += chunk
     })
 
-    child.on('error', (err) => {
+    child.on('error', (err: NodeJS.ErrnoException) => {
+      const hint =
+        err.code === 'ENOENT'
+          ? `Executable "${command}" was not found in PATH (${err.message})`
+          : `Failed to spawn "${command}": ${err.message}`
       finishError(
-        new AdapterError(`Failed to spawn "${command}": ${err.message}`, {
+        new AdapterError(hint, {
           exitCode: null,
           stderr,
           timedOut: false,
@@ -160,6 +165,65 @@ export interface CommandAdapterOptions {
   modelFlag?: string
 }
 
+export interface CliAdapterOptions {
+  command?: string
+  baseArgs?: string[]
+}
+
+export interface AdapterResolverOptions {
+  claude?: CliAdapterOptions
+  codex?: CliAdapterOptions
+}
+
+function assertExitZero(command: string, result: SubprocessResult): void {
+  if (result.exitCode === 0) {
+    return
+  }
+  const detailSource = result.stderr.trim() || result.stdout.trim()
+  const detail = detailSource.length > 0 ? `: ${detailSource.slice(0, 500)}` : ''
+  throw new AdapterError(
+    `Command "${command}" exited with code ${result.exitCode}${detail}`,
+    {
+      exitCode: result.exitCode,
+      stderr: result.stderr,
+      timedOut: false,
+    },
+  )
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined
+}
+
+function asFiniteNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined
+}
+
+function asString(value: unknown): string | undefined {
+  return typeof value === 'string' ? value : undefined
+}
+
+function extractUsage(rawUsage: unknown): AdapterUsage | undefined {
+  const usage = asRecord(rawUsage)
+  if (!usage) return undefined
+
+  const rawInput = asFiniteNumber(usage.inputTokens) ?? asFiniteNumber(usage.input_tokens)
+  const cacheCreation = asFiniteNumber(usage.cache_creation_input_tokens) ?? 0
+  const cacheRead = asFiniteNumber(usage.cache_read_input_tokens) ?? 0
+  const outputTokens = asFiniteNumber(usage.outputTokens) ?? asFiniteNumber(usage.output_tokens)
+
+  if (rawInput === undefined && outputTokens === undefined) {
+    return undefined
+  }
+
+  return {
+    inputTokens: (rawInput ?? 0) + cacheCreation + cacheRead,
+    outputTokens: outputTokens ?? 0,
+  }
+}
+
 function buildCommandArgs(options: CommandAdapterOptions, req: AdapterRequest): string[] {
   const baseArgs = options.args ?? []
   let replacedPlaceholder = false
@@ -200,22 +264,219 @@ export function createCommandAdapter(options: CommandAdapterOptions): Adapter {
         timeoutMs: req.timeoutMs,
       })
 
-      if (result.exitCode !== 0) {
-        const stderrPreview = result.stderr.trim()
-        const detail = stderrPreview.length > 0 ? `: ${stderrPreview}` : ''
-        throw new AdapterError(
-          `Command "${options.command}" exited with code ${result.exitCode}${detail}`,
-          {
-            exitCode: result.exitCode,
-            stderr: result.stderr,
-            timedOut: false,
-          },
-        )
-      }
+      assertExitZero(options.command, result)
 
       return {
         reply: result.stdout.trim(),
       }
+    },
+  }
+}
+
+function buildClaudeArgs(baseArgs: string[], req: AdapterRequest): string[] {
+  const argv = [...baseArgs, '-p', '--output-format', 'json']
+  if (req.model) {
+    argv.push('--model', req.model)
+  }
+  if (req.sessionId) {
+    argv.push('--resume', req.sessionId)
+  }
+  if (req.access === 'read') {
+    argv.push('--permission-mode', 'plan')
+  } else if (req.access === 'write') {
+    argv.push('--permission-mode', 'acceptEdits')
+  }
+  argv.push('--', req.prompt)
+  return argv
+}
+
+function parseClaudeOutput(stdout: string): AdapterResponse {
+  const trimmed = stdout.trim()
+  if (trimmed.length === 0) {
+    return { reply: '' }
+  }
+
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(trimmed)
+  } catch {
+    return { reply: trimmed }
+  }
+
+  const record = Array.isArray(parsed)
+    ? asRecord(parsed.at(-1))
+    : asRecord(parsed)
+  if (!record) {
+    return { reply: trimmed }
+  }
+
+  if (record.is_error === true) {
+    const detail = asString(record.result) ?? asString(record.error) ?? 'Claude CLI returned an error'
+    throw new AdapterError(`Claude CLI error: ${detail}`)
+  }
+
+  const reply =
+    asString(record.result) ??
+    asString(record.reply) ??
+    asString(record.message) ??
+    asString(record.text) ??
+    trimmed
+
+  const sessionId = asString(record.session_id) ?? asString(record.sessionId)
+  const usage = extractUsage(record.usage)
+
+  return {
+    reply: reply.trim(),
+    sessionId,
+    usage,
+  }
+}
+
+/**
+ * Claude Code CLI adapter using non-interactive `--print` mode with JSON output and `shell: false`.
+ */
+export function createClaudeAdapter(options: CliAdapterOptions = {}): Adapter {
+  const command = options.command ?? 'claude'
+  const baseArgs = options.baseArgs ?? []
+
+  return {
+    async run(req: AdapterRequest): Promise<AdapterResponse> {
+      const argv = buildClaudeArgs(baseArgs, req)
+      const result = await execSubprocess(command, argv, {
+        cwd: req.cwd,
+        timeoutMs: req.timeoutMs,
+      })
+
+      assertExitZero(command, result)
+      return parseClaudeOutput(result.stdout)
+    },
+  }
+}
+
+function buildCodexArgs(baseArgs: string[], req: AdapterRequest): string[] {
+  const argv = [...baseArgs, 'exec']
+  if (req.sessionId) {
+    argv.push('resume', '--json')
+    if (req.model) {
+      argv.push('-m', req.model)
+    }
+    argv.push(req.sessionId, req.prompt)
+    return argv
+  }
+
+  argv.push('--json', '-C', req.cwd)
+  if (req.model) {
+    argv.push('-m', req.model)
+  }
+  if (req.access === 'read') {
+    argv.push('-s', 'read-only')
+  } else if (req.access === 'write') {
+    argv.push('-s', 'workspace-write')
+  }
+  argv.push('--', req.prompt)
+  return argv
+}
+
+function extractCodexMessageText(event: Record<string, unknown>): string | undefined {
+  const item = asRecord(event.item)
+  if (!item) return undefined
+  if (item.type !== 'agent_message' && item.type !== 'message') {
+    return undefined
+  }
+  const directText = asString(item.text)
+  if (directText !== undefined) {
+    return directText
+  }
+  if (Array.isArray(item.content)) {
+    const texts = item.content
+      .map((part) => asString(asRecord(part)?.text))
+      .filter((t): t is string => t !== undefined)
+    if (texts.length > 0) {
+      return texts.join('\n')
+    }
+  }
+  return undefined
+}
+
+function parseCodexOutput(stdout: string): AdapterResponse {
+  const trimmed = stdout.trim()
+  if (trimmed.length === 0) {
+    return { reply: '' }
+  }
+
+  const lines = trimmed
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+
+  let parsedAnyJson = false
+  let sessionId: string | undefined
+  let reply: string | undefined
+  let usage: AdapterUsage | undefined
+  let failureMessage: string | undefined
+
+  for (const line of lines) {
+    let eventRaw: unknown
+    try {
+      eventRaw = JSON.parse(line)
+    } catch {
+      continue
+    }
+    const event = asRecord(eventRaw)
+    if (!event) continue
+    parsedAnyJson = true
+
+    if (event.type === 'thread.started') {
+      sessionId = asString(event.thread_id) ?? asString(event.session_id) ?? asString(event.sessionId)
+    } else if (event.type === 'item.completed') {
+      const text = extractCodexMessageText(event)
+      if (text !== undefined) {
+        reply = text
+      }
+    } else if (event.type === 'turn.completed') {
+      const parsedUsage = extractUsage(event.usage)
+      if (parsedUsage) {
+        usage = parsedUsage
+      }
+    } else if (event.type === 'turn.failed' || event.type === 'error') {
+      const errObj = asRecord(event.error)
+      failureMessage =
+        asString(errObj?.message) ?? asString(event.message) ?? 'Codex turn failed'
+    }
+  }
+
+  if (failureMessage) {
+    throw new AdapterError(`Codex CLI error: ${failureMessage}`)
+  }
+
+  if (!parsedAnyJson) {
+    return { reply: trimmed }
+  }
+
+  return {
+    reply: (reply ?? '').trim(),
+    sessionId,
+    usage,
+  }
+}
+
+/**
+ * Codex CLI adapter using non-interactive `codex exec --json` and `shell: false`.
+ */
+export function createCodexAdapter(options: CliAdapterOptions = {}): Adapter {
+  const command = options.command ?? 'codex'
+  const baseArgs = options.baseArgs ?? []
+
+  return {
+    async run(req: AdapterRequest): Promise<AdapterResponse> {
+      const argv = buildCodexArgs(baseArgs, req)
+      const result = await execSubprocess(command, argv, {
+        cwd: req.cwd,
+        timeoutMs: req.timeoutMs,
+      })
+
+      assertExitZero(command, result)
+      return parseCodexOutput(result.stdout)
     },
   }
 }
@@ -225,11 +486,20 @@ export function createCommandAdapter(options: CommandAdapterOptions): Adapter {
  */
 export function createAdapterResolver(
   overrides?: Partial<Record<string, Adapter>>,
+  defaults?: AdapterResolverOptions,
 ): AdapterResolver {
   return (roleName: string, roleConfig: RoleConfig): Adapter => {
     const override = overrides?.[roleName] ?? overrides?.[roleConfig.adapter]
     if (override) {
       return override
+    }
+
+    if (roleConfig.adapter === 'claude') {
+      return createClaudeAdapter(defaults?.claude)
+    }
+
+    if (roleConfig.adapter === 'codex') {
+      return createCodexAdapter(defaults?.codex)
     }
 
     if (roleConfig.adapter === 'command') {
@@ -243,7 +513,7 @@ export function createAdapterResolver(
     }
 
     throw new AdapterError(
-      `Adapter "${roleConfig.adapter}" for role "${roleName}" is not wired in this build; use "command" or provide an adapter override`,
+      `Unsupported adapter "${roleConfig.adapter}" for role "${roleName}"`,
     )
   }
 }
