@@ -208,7 +208,7 @@ async function parseRole(
   }
 }
 
-function parseRuntime(rawRuntime: unknown): RuntimeConfig {
+function parseRuntime(rawRuntime: unknown, repoRoot: string): RuntimeConfig {
   if (rawRuntime !== undefined && !isPlainObject(rawRuntime)) {
     throw new ConfigValidationError('Invalid "runtime": expected an object')
   }
@@ -269,6 +269,12 @@ function parseRuntime(rawRuntime: unknown): RuntimeConfig {
     evt.path === undefined
       ? '.piedpiper/events.jsonl'
       : assertNonEmptyString(evt.path, 'runtime.eventLog.path')
+  const resolvedEvtPath = path.resolve(repoRoot, evtPath)
+  if (!isSubPath(repoRoot, resolvedEvtPath)) {
+    throw new ConfigValidationError(
+      `Invalid "runtime.eventLog.path": path "${evtPath}" must stay inside repository root`,
+    )
+  }
 
   return {
     notifications: { desktop, githubMention, githubHandle },
@@ -337,7 +343,7 @@ export async function loadConfig(
     roles[roleName] = await parseRole(roleName, rawRole, resolvedRoot, piedpiperDir)
   }
 
-  const runtime = parseRuntime(parsed.runtime)
+  const runtime = parseRuntime(parsed.runtime, resolvedRoot)
   const warnings = collectWarnings(roles)
 
   return {
